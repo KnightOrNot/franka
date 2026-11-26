@@ -1,0 +1,78 @@
+--- a/polymetis/polymetis/python/scripts/launch_robot.py
++++ b/polymetis/polymetis/python/scripts/launch_robot.py
+@@ -36,6 +36,8 @@
+     ip = str(cfg.ip)
+     port = str(cfg.port)
+
++    owned_shutdown = os.getenv("FRANKA_CAPTURE_OWNED_ROBOT_SHUTDOWN") == "1"
++
+     # Start server
+     log.info(f"Starting server")
+     server_exec_path = which(cfg.server_exec)
+@@ -46,17 +48,34 @@
+
+     if cfg.use_real_time:
+         log.info(f"Acquiring sudo...")
+-        subprocess.run(["sudo", "echo", '"Acquired sudo."'], check=True)
+-
+-        server_cmd = ["sudo", "-s", "env", '"PATH=$PATH"'] + server_cmd + ["-r"]
++        if owned_shutdown:
++            subprocess.run(["sudo", "-n", "true"], check=True)
++            sudo = ["sudo", "-n"]
++        else:
++            subprocess.run(["sudo", "echo", '"Acquired sudo."'], check=True)
++            sudo = ["sudo"]
++        server_cmd = sudo + ["-s", "env", '"PATH=$PATH"'] + server_cmd + ["-r"]
+         log.info(f"Server command: {' '.join(server_cmd)}")
+     server_output = subprocess.Popen(
+         server_cmd, stdout=sys.stdout, stderr=sys.stderr, preexec_fn=os.setpgrp
+     )
+     pgid = os.getpgid(server_output.pid)
+
+-    # Kill process at the end
+-    if cfg.use_real_time:
++    # In the managed session, signal the exact subprocess created above.
++    # The sudo monitor forwards SIGTERM to the real-time server.
++    if owned_shutdown:
++
++        def cleanup():
++            if server_output.poll() is not None:
++                return
++            try:
++                server_output.terminate()
++                server_output.wait(timeout=8)
++            except ProcessLookupError:
++                pass
++
++    # Legacy use remains unchanged.
++    elif cfg.use_real_time:
+
+         def cleanup():
+             log.info(
+@@ -71,8 +90,24 @@
+             subprocess.check_call(["bash", "-c", f"lsof -t -i:{port} | xargs -r kill -9"])
+
+     atexit.register(cleanup)
+-    signal.signal(signal.SIGTERM, lambda signal_number, stack_frame: cleanup())
+-    signal.signal(signal.SIGINT, lambda signal_number, stack_frame: cleanup())
++    if owned_shutdown:
++
++        def exit_on_signal(signal_number, stack_frame):
++            status = 128 + signal_number
++            try:
++                cleanup()
++            except (OSError, subprocess.TimeoutExpired):
++                log.exception("Owned real-time server did not stop")
++                status = 74
++            finally:
++                atexit.unregister(cleanup)
++            sys.exit(status)
++
++        signal.signal(signal.SIGTERM, exit_on_signal)
++        signal.signal(signal.SIGINT, exit_on_signal)
++    else:
++        signal.signal(signal.SIGTERM, lambda signal_number, stack_frame: cleanup())
++        signal.signal(signal.SIGINT, lambda signal_number, stack_frame: cleanup())
+
+     # Start client
+     if cfg.robot_client:

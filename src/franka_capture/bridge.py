@@ -1,8 +1,30 @@
 """Copy this standard-library module next to Franka's run_env.py (Python 3.8+)."""
 
 import json
+import math
 import socket
 import uuid
+from numbers import Real
+from typing import Iterable, List
+
+
+def fr3_feedback_in_action_coordinates(feedback: Iterable[float]) -> List[float]:
+    """Copy the seven FR3 joints and convert opening feedback to closure for startup."""
+    try:
+        joints = list(feedback)
+        valid = len(joints) == 8 and all(
+            isinstance(joint, Real) and not isinstance(joint, bool) and math.isfinite(joint)
+            for joint in joints
+        )
+    except (TypeError, ValueError, OverflowError):
+        valid = False
+    if not valid:
+        raise ValueError("FR3 startup feedback must contain eight finite values")
+
+    opening = float(joints[-1])
+    if not 0.0 <= opening <= 1.0:
+        raise ValueError("FR3 startup gripper opening must be between 0 and 1")
+    return [float(joint) for joint in joints[:7]] + [1.0 - opening]
 
 
 class Sender:
