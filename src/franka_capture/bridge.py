@@ -1,0 +1,48 @@
+"""Copy this standard-library module next to Franka's run_env.py (Python 3.8+)."""
+
+import json
+import socket
+import uuid
+
+
+class Sender:
+    """Send at most one datagram per completed cycle; no retries or waiting."""
+
+    def __init__(self, endpoint):
+        self.endpoint = str(endpoint)
+        self.epoch = uuid.uuid4().hex
+        self.seq = 0
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.socket.setblocking(False)
+
+    def publish(self, feedback, requested, observed_ns, command_ns):
+        seq, self.seq = self.seq, self.seq + 1
+        try:
+            packet = json.dumps(
+                {
+                    "v": 1,
+                    "epoch": self.epoch,
+                    "seq": seq,
+                    "feedback": list(map(float, feedback)),
+                    "requested": list(map(float, requested)),
+                    "observed_ns": observed_ns,
+                    "command_ns": command_ns,
+                },
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode()
+            if len(packet) > 4096:
+                return False
+            self.socket.sendto(packet, self.endpoint)
+        except (OSError, ValueError, TypeError, OverflowError):
+            return False
+        return True
+
+    def close(self):
+        self.socket.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()

@@ -1,0 +1,71 @@
+--- a/teleop/teleop/env.py
++++ b/teleop/teleop/env.py
+@@ -28,6 +28,9 @@
+         self._robot = robot
+         self._rate = Rate(control_rate_hz)
+         self._camera_dict = {} if camera_dict is None else camera_dict
++        self.capture_timing = False
++        self.last_observation_monotonic_ns = 0
++        self.last_command_monotonic_ns = 0
+
+     def robot(self) -> Robot:
+         """Get the robot object.
+@@ -53,6 +56,8 @@
+             self._robot.num_dofs()
+         ), f"input:{len(joints)}, robot:{self._robot.num_dofs()}"
+         assert self._robot.num_dofs() == len(joints)
++        if self.capture_timing:
++            self.last_command_monotonic_ns = time.monotonic_ns()
+         self._robot.command_joint_state(joints)
+         self._rate.sleep()
+         return self.get_obs()
+@@ -70,6 +75,8 @@
+             observations[f"{name}_depth"] = depth
+
+         robot_obs = self._robot.get_observations()
++        if self.capture_timing:
++            self.last_observation_monotonic_ns = time.monotonic_ns()
+         assert "joint_positions" in robot_obs
+         assert "joint_velocities" in robot_obs
+         assert "ee_pos_quat" in robot_obs
+--- a/teleop/experiments/run_env.py
++++ b/teleop/experiments/run_env.py
+@@ -1,5 +1,6 @@
+ import datetime
+ import glob
++import os
+ import time
+ from dataclasses import dataclass
+ from pathlib import Path
+@@ -55,6 +56,16 @@
+         }
+         robot_client = ZMQClientRobot(port=args.tele_port, host=args.hostname)
+     env = RobotEnv(robot_client, control_rate_hz=args.hz, camera_dict=camera_clients)
++    telemetry = None
++    endpoint = os.environ.get("FRANKA_CAPTURE_SOCKET")
++    if endpoint and args.agent == "teleop" and not args.bimanual and not args.mock:
++        try:
++            from franka_capture_bridge import Sender
++
++            telemetry = Sender(endpoint)
++            env.capture_timing = True
++        except (ImportError, OSError) as exc:
++            print(f"Franka capture telemetry unavailable: {exc}")
+
+     if args.bimanual:
+         if args.agent == "teleop":
+@@ -243,7 +254,13 @@
+                 save_path = None
+             else:
+                 raise ValueError(f"Invalid state {state}")
+-        obs = env.step(action)
++        if telemetry is None:
++            obs = env.step(action)
++        else:
++            before = obs["joint_positions"]
++            observed_ns = env.last_observation_monotonic_ns
++            obs = env.step(action)
++            telemetry.publish(before, action, observed_ns, env.last_command_monotonic_ns)
+
+
+ if __name__ == "__main__":
