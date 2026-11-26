@@ -20,14 +20,8 @@ from .camera import make_camera
 from .datasets import DatasetService
 from .episode import read_episode
 from .recording import CaptureError, Collector
-from .telemetry import PACKET_LIMIT, Cycle, open_receiver
+from .telemetry import PACKET_LIMIT, Cycle, open_receiver, socket_default
 from .web import OperatorServer
-
-
-def _socket_default() -> Path:
-    xdg = os.environ.get("XDG_RUNTIME_DIR")
-    base = Path(xdg) / "franka-capture" if xdg else Path(f"/tmp/franka-capture-{os.getuid()}")
-    return base / "telemetry.sock"
 
 
 @contextmanager
@@ -126,7 +120,7 @@ def _start_args(parser):
     parser.add_argument(
         "--data-root", type=Path, help="raw directory (different defaults for simulation)"
     )
-    parser.add_argument("--socket", type=Path, default=_socket_default())
+    parser.add_argument("--socket", type=Path, default=socket_default())
     parser.add_argument("--serial", default="")
     parser.add_argument("--width", type=int)
     parser.add_argument("--height", type=int)

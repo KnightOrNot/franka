@@ -17,6 +17,12 @@ MAX_OPEN_M = 0.09  # fr3.py in the inspected Franka deployment
 JOINT_NAMES = tuple(f"joint_{axis}" for axis in range(1, 8)) + ("gripper_opening_m",)
 
 
+def socket_default() -> Path:
+    xdg = os.environ.get("XDG_RUNTIME_DIR")
+    base = Path(xdg) / "franka-capture" if xdg else Path(f"/tmp/franka-capture-{os.getuid()}")
+    return base / "telemetry.sock"
+
+
 def _vector(value: object) -> tuple[float, ...]:
     if not isinstance(value, (tuple, list)) or len(value) != 8:
         raise ValueError("expected seven joints plus one gripper value")

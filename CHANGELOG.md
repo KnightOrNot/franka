@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.0 — 2026-11-26
+
+- Supervise the verified root FR3 teleoperation and capture workflow from one foreground command.
+- Align leader and follower gripper coordinates for startup without changing legacy launchers,
+  safety thresholds, or the raw telemetry format.
+
 ## 0.2.0 — 2026-11-26
 
 - Convert selected saved episodes from one task into a downloadable LeRobot v3 dataset on the controller.
