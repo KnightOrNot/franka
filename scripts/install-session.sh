@@ -32,25 +32,31 @@ mv -- "$robot" "$robot_new"
 mv -- "$follow" "$follow_new"
 cp -- "$repo/src/franka_capture/bridge.py" "$bridge"
 
-for name in "$robot_new" "$follow_new" "$bridge"; do
-    target="$teleop/$name"
-    if [[ -L $target || ( -e $target && ! -f $target ) ]]; then
-        printf 'Invalid session destination: %s\n' "$target" >&2
-        exit 1
-    fi
-    if [[ -e $target ]] && ! cmp -s -- "$name" "$target"; then
-        printf 'Existing dedicated session file differs: %s\n' "$target" >&2
-        exit 1
-    fi
-done
-for name in "$robot_new" "$follow_new" "$bridge"; do
-    target="$teleop/$name"
-    if [[ ! -e $target ]]; then
+target="$teleop/$robot_new"
+if [[ -L $target || ( -e $target && ! -f $target ) ]]; then
+    printf 'Invalid session destination: %s\n' "$target" >&2
+    exit 1
+fi
+if [[ ! -e $target ]]; then
+    tmp="$(mktemp "${target}.XXXXXX")"
+    cp -- "$robot_new" "$tmp"
+    mv -n -- "$tmp" "$target"
+fi
+if ! cmp -s -- "$robot_new" "$target"; then
+    printf 'Existing dedicated robot session file differs: %s\n' "$target" >&2
+    exit 1
+fi
+
+# Keep the generated follow entry and bridge with the capture version that owns them.
+# Older releases and the vendor teleop tree retain their existing follow files.
+follow_dir="$repo/.native/follow"
+mkdir -p -- "$follow_dir"
+for name in "$follow_new" "$bridge"; do
+    target="$follow_dir/${name##*/}"
+    if ! cmp -s -- "$name" "$target"; then
         tmp="$(mktemp "${target}.XXXXXX")"
         cp -- "$name" "$tmp"
-        mv -n -- "$tmp" "$target"
-        test ! -e "$tmp" || rm -- "$tmp"
-        cmp -- "$name" "$target"
+        mv -- "$tmp" "$target"
     fi
 done
 printf 'Dedicated FR3 session entries installed. No control or capture process was started.\n'

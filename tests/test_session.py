@@ -131,10 +131,10 @@ def test_follow_stage_is_opt_in_and_uses_root_ports(tmp_path):
         conda=Path("/some conda.sh"),
         polymetis_prefix=None,
         serial=Path("/dev/example"),
-        teleop=tmp_path,
+        teleop=tmp_path / "vendor",
     )
     argv = session.robot_command(cfg, "follow")
-    assert str(tmp_path / "teleop/experiments/run_env_capture.py") in argv
+    assert str(tmp_path / ".native/follow/run_env_capture.py") in argv
     assert "--teleop-port=/dev/example" in argv
     assert "--tele-port=6001" in argv
     assert "--agent=teleop" in argv
@@ -252,7 +252,7 @@ def test_full_sequence_waits_for_feedback_and_gripper_disconnect(monkeypatch, tm
         ("robot", "robot feedback"),
         ("gripper", "gripper feedback"),
         ("node", "FR3 home and node"),
-        ("follow", "fresh robot telemetry"),
+        ("follow", "startup alignment and fresh robot telemetry"),
     ]
     assert {file.name for file in tmp_path.glob("follow-*/*.log")} == {
         "robot.log",
@@ -408,3 +408,14 @@ def test_gripper_launch_routes_to_separate_managed_driver(tmp_path):
     assert str(tmp_path / "scripts/managed_gripper.py") in command
     assert f"--binary={tmp_path / '.native/franka_hand_capture_client'}" in command
     assert str(tmp_path / session.POLY / "python/scripts/launch_gripper.py") not in command
+
+
+def test_follow_exposes_precise_alignment_failure(monkeypatch, tmp_path):
+    (tmp_path / "follow.log").write_text(
+        "Paced FR3 alignment\n"
+        "FR3_ALIGNMENT_FAILED FR3 alignment timed out after 8 s: J4: gap 0.510 rad\n"
+        "Traceback (most recent call last)\n"
+    )
+    monkeypatch.setattr(session, "child_exit", lambda proc: 1)
+    with pytest.raises(session.SessionError, match=r"J4: gap 0[.]510 rad.*follow[.]log"):
+        session.check_children([("follow", Child(20))], logs=tmp_path, subphase="fresh telemetry")

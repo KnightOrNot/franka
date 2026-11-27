@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.4 — 2026-11-27
+
+- Pace FR3 launch alignment by measured joint feedback with a bounded slew rate and timeout, without changing live follow cadence.
+- Show named joint and gripper alignment failures in the web page and session logs.
+
 ## 0.4.3 — 2026-11-27
 
 - Drain in-flight Franka Hand commands and confirm the SDK disconnect on Ctrl+C or web Stop Follow, without issuing new gripper motion during shutdown.

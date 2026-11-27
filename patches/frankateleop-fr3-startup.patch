@@ -1,6 +1,6 @@
 --- a/teleop/experiments/run_env.py
 +++ b/teleop/experiments/run_env.py
-@@ -45,6 +45,20 @@
+@@ -45,6 +45,22 @@
 
 
  def main(args):
@@ -12,7 +12,9 @@
 +            raise ValueError("FR3 closure startup requires a seven-joint reset target, if set")
 +        import stat
 +
-+        from franka_capture_session_bridge import Sender, fr3_feedback_in_action_coordinates
++        from franka_capture_session_bridge import (
++            Sender, align_fr3, fr3_feedback_in_action_coordinates,
++        )
 +
 +        capture_endpoint = os.environ.get("FRANKA_CAPTURE_SOCKET", "")
 +        if not os.path.isabs(capture_endpoint) or not stat.S_ISSOCK(os.stat(capture_endpoint).st_mode):
@@ -21,7 +23,7 @@
      if args.mock:
          robot_client = PrintRobot(8, dont_print=True)
          camera_clients = {}
-@@ -58,7 +72,10 @@
+@@ -58,7 +74,10 @@
      env = RobotEnv(robot_client, control_rate_hz=args.hz, camera_dict=camera_clients)
      telemetry = None
      endpoint = os.environ.get("FRANKA_CAPTURE_SOCKET")
@@ -33,7 +35,7 @@
          try:
              from franka_capture_bridge import Sender
 
-@@ -137,6 +154,8 @@
+@@ -137,6 +156,8 @@
              curr_joints = env.get_obs()["joint_positions"]
              curr_joints = np.array(curr_joints)
              if reset_joints.shape == curr_joints.shape:
@@ -42,75 +44,150 @@
                  max_delta = (np.abs(curr_joints - reset_joints)).max()
                  steps = min(int(max_delta / 0.01), 100)
 
-@@ -158,12 +177,32 @@
+@@ -158,62 +179,80 @@
          else:
              raise ValueError("Invalid agent name")
 
-+    def startup_feedback(observation):
-+        feedback = observation["joint_positions"]
-+        if fr3_closure_startup:
-+            return np.array(fr3_feedback_in_action_coordinates(feedback))
-+        return feedback
-+
-+    def startup_action(observation):
-+        action = agent.act(observation)
-+        if fr3_closure_startup:
-+            action = np.asarray(action)
-+            if (
-+                action.shape != (8,)
-+                or action.dtype.kind not in "fiu"
-+                or not np.isfinite(action).all()
-+                or not 0.0 <= action[-1] <= 1.0
-+            ):
-+                raise ValueError(
-+                    "FR3 startup action requires seven finite joints and closure in [0, 1]"
-+                )
-+        return action
-+
-     # going to start position
-     print("Going to start position")
+-    # going to start position
+-    print("Going to start position")
 -    start_pos = agent.act(env.get_obs())
-+    start_pos = startup_action(env.get_obs())
-     obs = env.get_obs()
+-    obs = env.get_obs()
 -    joints = obs["joint_positions"]
 -    joints = np.array(joints)
-+    joints = np.array(startup_feedback(obs))
+-
+-    abs_deltas = np.abs(start_pos - joints)
+-    id_max_joint_delta = np.argmax(abs_deltas)
+-
+-    max_joint_delta = 0.8
+-    if abs_deltas[id_max_joint_delta] > max_joint_delta:
+-        id_mask = abs_deltas > max_joint_delta
+-        print()
+-
+-        ids = np.arange(len(id_mask))[id_mask]
+-        for i, delta, joint, current_j in zip(
+-            ids,
+-            abs_deltas[id_mask],
+-            start_pos[id_mask],
+-            joints[id_mask],
+-        ):
+-            print(
+-                f"joint[{i}]: \t delta: {delta:4.3f} , leader: \t{joint:4.3f} , follower: \t{current_j:4.3f}"
+-            )
+-        return
++    initial_action = None
++    if fr3_closure_startup:
++        def read_alignment():
++            nonlocal obs
++            obs = env.get_obs()
++            feedback = fr3_feedback_in_action_coordinates(obs["joint_positions"])
++            return agent.act(obs), feedback
 
-     abs_deltas = np.abs(start_pos - joints)
-     id_max_joint_delta = np.argmax(abs_deltas)
-@@ -183,6 +222,8 @@
-             print(
-                 f"joint[{i}]: \t delta: {delta:4.3f} , leader: \t{joint:4.3f} , follower: \t{current_j:4.3f}"
-             )
-+        if fr3_closure_startup:
-+            raise ValueError("FR3 startup leader/follower delta exceeds 0.8")
-         return
+-    print(f"Start pos: {len(start_pos)}", f"Joints: {len(joints)}")
+-    assert len(start_pos) == len(
+-        joints
+-    ), f"agent output dim = {len(start_pos)}, but env dim = {len(joints)}"
++        obs = None
++        try:
++            def send_alignment(command):
++                env.step(np.asarray(command))
 
-     print(f"Start pos: {len(start_pos)}", f"Joints: {len(joints)}")
-@@ -193,8 +234,8 @@
-     max_delta = 0.05
-     for _ in range(25):
+-    max_delta = 0.05
+-    for _ in range(25):
++            initial_action = np.asarray(align_fr3(read_alignment, send_alignment))
++        except ValueError as exc:
++            print(f"FR3_ALIGNMENT_FAILED {exc}", flush=True)
++            raise
++    else:
++        # going to start position
++        print("Going to start position")
++        start_pos = agent.act(env.get_obs())
          obs = env.get_obs()
 -        command_joints = agent.act(obs)
 -        current_joints = obs["joint_positions"]
-+        command_joints = startup_action(obs)
-+        current_joints = startup_feedback(obs)
-         delta = command_joints - current_joints
-         max_joint_delta = np.abs(delta).max()
-         if max_joint_delta > max_delta:
-@@ -202,9 +243,12 @@
-         env.step(current_joints + delta)
-
-     obs = env.get_obs()
+-        delta = command_joints - current_joints
+-        max_joint_delta = np.abs(delta).max()
+-        if max_joint_delta > max_delta:
+-            delta = delta / max_joint_delta * max_delta
+-        env.step(current_joints + delta)
+-
+-    obs = env.get_obs()
 -    joints = obs["joint_positions"]
 -    action = agent.act(obs)
 -    if (action - joints > 0.5).any():
-+    joints = startup_feedback(obs)
-+    action = startup_action(obs)
-+    if fr3_closure_startup:
-+        if (np.abs(action - joints) > 0.5).any():
-+            raise ValueError("FR3 startup leader/follower delta exceeds 0.5 after alignment")
-+    elif (action - joints > 0.5).any():
-         print("Action is too big")
+-        print("Action is too big")
+-
+-        # print which joints are too big
+-        joint_index = np.where(action - joints > 0.8)
+-        for j in joint_index:
+-            print(
+-                f"Joint [{j}], leader: {action[j]}, follower: {joints[j]}, diff: {action[j] - joints[j]}"
+-            )
+-        exit()
++        joints = obs["joint_positions"]
++        joints = np.array(joints)
++
++        abs_deltas = np.abs(start_pos - joints)
++        id_max_joint_delta = np.argmax(abs_deltas)
++
++        max_joint_delta = 0.8
++        if abs_deltas[id_max_joint_delta] > max_joint_delta:
++            id_mask = abs_deltas > max_joint_delta
++            print()
++
++            ids = np.arange(len(id_mask))[id_mask]
++            for i, delta, joint, current_j in zip(
++                ids,
++                abs_deltas[id_mask],
++                start_pos[id_mask],
++                joints[id_mask],
++            ):
++                print(
++                    f"joint[{i}]: \t delta: {delta:4.3f} , leader: \t{joint:4.3f} , follower: \t{current_j:4.3f}"
++                )
++            return
++
++        print(f"Start pos: {len(start_pos)}", f"Joints: {len(joints)}")
++        assert len(start_pos) == len(
++            joints
++        ), f"agent output dim = {len(start_pos)}, but env dim = {len(joints)}"
++
++        max_delta = 0.05
++        for _ in range(25):
++            obs = env.get_obs()
++            command_joints = agent.act(obs)
++            current_joints = obs["joint_positions"]
++            delta = command_joints - current_joints
++            max_joint_delta = np.abs(delta).max()
++            if max_joint_delta > max_delta:
++                delta = delta / max_joint_delta * max_delta
++            env.step(current_joints + delta)
++
++        obs = env.get_obs()
++        joints = obs["joint_positions"]
++        action = agent.act(obs)
++        if (action - joints > 0.5).any():
++            print("Action is too big")
++
++            # print which joints are too big
++            joint_index = np.where(action - joints > 0.8)
++            for j in joint_index:
++                print(
++                    f"Joint [{j}], leader: {action[j]}, follower: {joints[j]}, diff: {action[j] - joints[j]}"
++                )
++            exit()
 
-         # print which joints are too big
+     if args.use_save_interface:
+         from teleop.data_utils.keyboard_interface import KBReset
+@@ -234,7 +273,11 @@
+             end="",
+             flush=True,
+         )
+-        action = agent.act(obs)
++        if initial_action is None:
++            action = agent.act(obs)
++        else:
++            # Handoff uses the leader target already verified by the alignment loop.
++            action, initial_action = initial_action, None
+         dt = datetime.datetime.now()
+         if args.use_save_interface:
+             state = kb_interface.update()

@@ -50,7 +50,8 @@ MANAGED_GRIPPER = Path("scripts/managed_gripper.py")
 HAND_BINARY = Path(".native/franka_hand_capture_client")
 HAND_STOP_TIMEOUT = 18
 NODE = Path("teleop/experiments/launch_nodes.py")
-FOLLOW = Path("teleop/experiments/run_env_capture.py")
+FOLLOW = Path(".native/follow/run_env_capture.py")
+ALIGNMENT_FAILURE = "FR3_ALIGNMENT_FAILED "
 FR3 = Path("teleop/teleop/robots/fr3.py")
 MAP = Path("teleop/teleop/agents/teleop_agent.py")
 MODEL = POLY / "conf/robot_model/franka_panda.yaml"
@@ -151,14 +152,15 @@ def config() -> Config:
     for path, digest in VERIFIED_SOURCES.items():
         if hashlib.sha256((teleop / path).read_bytes()).hexdigest() != digest:
             raise SessionError(f"unverified root FR3 controller source: {path}")
-    for path, marker in ((ROBOT, SHUTDOWN_FLAG), (FOLLOW, CLOSURE_FLAG)):
-        if marker not in (teleop / path).read_text():
-            raise SessionError(
-                f"required session patch is missing in {path}; see docs/deployment.md"
-            )
-    bridge = teleop / "teleop/experiments/franka_capture_session_bridge.py"
-    if "def fr3_feedback_in_action_coordinates(" not in bridge.read_text():
-        raise SessionError("FR3 startup bridge helper is missing")
+    robot = teleop / ROBOT
+    if not robot.is_file() or SHUTDOWN_FLAG not in robot.read_text():
+        raise SessionError(f"required session patch is missing in {robot}; run install-session.sh")
+    follow = repo / FOLLOW
+    if not follow.is_file() or "align_fr3(read_alignment," not in follow.read_text():
+        raise SessionError("paced FR3 follow entry is missing; run install-session.sh")
+    bridge = follow.with_name("franka_capture_session_bridge.py")
+    if not bridge.is_file() or "def align_fr3(" not in bridge.read_text():
+        raise SessionError("paced FR3 bridge helper is missing; run install-session.sh")
     home_line = re.search(r"^rest_pose:\s*(\[[^\n]+\])\s*$", (teleop / MODEL).read_text(), re.M)
     home = ast.literal_eval(home_line[1]) if home_line else []
     if len(home) != 7 or not all(type(x) in (int, float) and math.isfinite(x) for x in home):
@@ -254,7 +256,7 @@ def robot_command(cfg: Config, stage: str) -> list[str]:
         ]
     elif stage == "follow":
         args = [
-            str(cfg.teleop / FOLLOW),
+            str(cfg.repo / FOLLOW),
             "--agent=teleop",
             f"--hostname={LOOPBACK}",
             f"--tele-port={NODE_PORT}",
@@ -361,12 +363,25 @@ def child_exit(proc: subprocess.Popen) -> int | None:
     return result.si_status if result.si_code == os.CLD_EXITED else -result.si_status
 
 
+def alignment_failure(log: Path) -> str:
+    try:
+        with log.open("rb") as stream:
+            stream.seek(max(0, log.stat().st_size - 8192))
+            for line in reversed(stream.read(8192).decode("utf-8", "replace").splitlines()):
+                if line.startswith(ALIGNMENT_FAILURE):
+                    return line[len(ALIGNMENT_FAILURE) :]
+    except OSError:
+        pass
+    return ""
+
+
 def check_children(children: Children, *, logs: Path, subphase: str) -> None:
     for name, proc in children:
         if (rc := child_exit(proc)) is not None:
-            raise SessionError(
-                f"{name}: exited ({rc}) during {subphase}; log {logs / (name + '.log')}"
-            )
+            log = logs / f"{name}.log"
+            diagnostic = alignment_failure(log) if name == "follow" else ""
+            detail = f": {diagnostic}" if diagnostic else ""
+            raise SessionError(f"{name}: exited ({rc}) during {subphase}{detail}; log {log}")
 
 
 def wait_ready(
@@ -530,7 +545,7 @@ def run_follow(cfg: Config, logs: Path, attempt: FollowAttempt) -> None:
         ("node", "FR3 home and node", 90, cfg.teleop, lambda: tcp_ready(NODE_PORT)),
         (
             "follow",
-            "fresh robot telemetry",
+            "startup alignment and fresh robot telemetry",
             35,
             cfg.teleop,
             lambda: fresh_telemetry(cfg.port, follow_spawn_time),
