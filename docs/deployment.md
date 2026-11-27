@@ -159,3 +159,16 @@ export FRANKA_CAPTURE_CONFIG="$HOME/projects/franka/config/site.env"
 
 若磁盘错误后网页提示相机写入器未收尾，恢复空间再重启数采服务。失败或超时回合保留
 为 `.partial`，不要手工改成完整回合。
+
+## 项目内的控制环境
+
+控制环境复制或安装到项目内后，可在站点配置中设置 `FRANKA_POLYMETIS_PREFIX`，
+指向含有 `bin/python` 的环境根目录。设置后不再读取外部 `conda.sh`，
+也不从调用终端继承 Python 和动态库搜索路径。配合 `FRANKA_TELEOP_ROOT` 指向
+项目内的 `third-party/frankateleop`。该 Python 环境的 Polymetis 和 Teleop
+包绑定、原生客户端及其动态库也必须指向项目内的实际文件。仅复制已有构建目录
+不会重写 ELF 路径。未设置此前缀时仍支持原有 Conda 环境。
+
+站点数据目录和遥测 socket 可分别通过 `FRANKA_CAPTURE_DATA_ROOT`、
+`FRANKA_CAPTURE_DATASET_ROOT`、`FRANKA_CAPTURE_SOCKET` 指向项目内的专用目录。
+外部代码、单独部署的运行环境和站点数据不需要进入 Git。

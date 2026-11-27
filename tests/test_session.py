@@ -103,7 +103,10 @@ def test_failed_robot_feedback_never_runs_gripper_or_follow(monkeypatch, tmp_pat
 
 def test_follow_stage_is_opt_in_and_uses_root_ports(tmp_path):
     cfg = SimpleNamespace(
-        conda=Path("/some conda.sh"), serial=Path("/dev/example"), teleop=tmp_path
+        conda=Path("/some conda.sh"),
+        polymetis_prefix=None,
+        serial=Path("/dev/example"),
+        teleop=tmp_path,
     )
     argv = session.robot_command(cfg, "follow")
     assert str(tmp_path / "teleop/experiments/run_env_capture.py") in argv
@@ -190,3 +193,20 @@ def test_supervisor_detects_owned_cleanup_failure(monkeypatch, capsys):
     monkeypatch.setattr(session.os, "killpg", lambda pid, sig: None)
     assert not session.stop_owned([("robot", Child(34, exit_code=74))])
     assert "74" in capsys.readouterr().err
+
+
+def test_project_local_prefix_launch_ignores_legacy_conda_and_injected_paths(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", "/outside/conda/bin")
+    monkeypatch.setenv("PYTHONPATH", "/outside/teleop")
+    cfg = SimpleNamespace(
+        conda=Path("/missing/conda.sh"),
+        polymetis_prefix=tmp_path / "local conda",
+    )
+    cmd = session.conda_command(cfg, "python", "-c", "pass")
+    assert cmd[0] == "/usr/bin/env"
+    assert ["-u", "PYTHONPATH"] == cmd[cmd.index("PYTHONPATH") - 1 : cmd.index("PYTHONPATH") + 1]
+    assert "PYTHONNOUSERSITE=1" in cmd
+    assert "MKL_INTERFACE_LAYER=LP64,GNU" in cmd
+    assert f"CONDA_PREFIX={cfg.polymetis_prefix}" in cmd
+    assert cmd[-3:] == [str(cfg.polymetis_prefix / "bin/python"), "-c", "pass"]
+    assert not any("/outside" in arg or "/missing" in arg for arg in cmd)

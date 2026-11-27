@@ -73,11 +73,12 @@ class SessionError(RuntimeError):
 class Config:
     repo: Path
     teleop: Path
-    conda: Path
+    conda: Path | None
     serial: Path
     port: int
     home: tuple[float, ...]
     socket_path: Path
+    polymetis_prefix: Path | None = None
 
 
 def select_leader(source: str, devices: Path) -> Path:
@@ -109,11 +110,20 @@ def select_leader(source: str, devices: Path) -> Path:
 def config() -> Config:
     repo = Path.cwd()
     teleop = Path(os.environ.get("FRANKA_TELEOP_ROOT") or Path.home() / "frankateleop").resolve()
-    conda = Path(
-        os.environ.get("FRANKA_CONDA_SH") or Path.home() / "miniconda3/etc/profile.d/conda.sh"
-    ).resolve()
-    if not conda.is_file() or not (teleop / GRIPPER).is_file():
-        raise SessionError("root Polymetis checkout or conda.sh is missing")
+    prefix_env = os.environ.get("FRANKA_POLYMETIS_PREFIX")
+    prefix = Path(prefix_env).expanduser().resolve() if prefix_env else None
+    conda = None
+    if prefix:
+        if not os.access(prefix / "bin/python", os.X_OK):
+            raise SessionError(f"project Polymetis interpreter is missing: {prefix}")
+    else:
+        conda = Path(
+            os.environ.get("FRANKA_CONDA_SH") or Path.home() / "miniconda3/etc/profile.d/conda.sh"
+        ).resolve()
+        if not conda.is_file():
+            raise SessionError("conda.sh is missing")
+    if not (teleop / GRIPPER).is_file():
+        raise SessionError(f"root Polymetis checkout is missing: {teleop}")
     for path, digest in VERIFIED_SOURCES.items():
         if hashlib.sha256((teleop / path).read_bytes()).hexdigest() != digest:
             raise SessionError(f"unverified root FR3 controller source: {path}")
@@ -137,7 +147,7 @@ def config() -> Config:
     socket_path = (Path(endpoint) if endpoint else socket_default()).expanduser().absolute()
     if len(os.fsencode(socket_path)) >= 108:
         raise SessionError("telemetry socket path is too long")
-    return Config(repo, teleop, conda, serial, port, tuple(home), socket_path)
+    return Config(repo, teleop, conda, serial, port, tuple(home), socket_path, prefix)
 
 
 def check_ports(port: int) -> None:
@@ -154,6 +164,30 @@ def check_ports(port: int) -> None:
 
 
 def conda_command(cfg: Config, *argv: str) -> list[str]:
+    if cfg.polymetis_prefix is not None:
+        if argv[0] != "python":
+            raise ValueError("local Polymetis commands must use its Python interpreter")
+        prefix = cfg.polymetis_prefix
+        system_path = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        return [
+            "/usr/bin/env",
+            "-u",
+            "PYTHONPATH",
+            "-u",
+            "PYTHONHOME",
+            "-u",
+            "LD_LIBRARY_PATH",
+            "-u",
+            "LD_PRELOAD",
+            "-u",
+            "LD_AUDIT",
+            "PYTHONNOUSERSITE=1",
+            "MKL_INTERFACE_LAYER=LP64,GNU",
+            f"CONDA_PREFIX={prefix}",
+            f"PATH={prefix / 'bin'}:{system_path}",
+            str(prefix / "bin/python"),
+            *argv[1:],
+        ]
     return [
         "bash",
         "-c",
