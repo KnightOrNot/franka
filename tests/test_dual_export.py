@@ -11,18 +11,28 @@ from franka_capture.export import build_bundle, export_episode
 from franka_capture.telemetry import Cycle
 
 _START = 1_000_000_000
-_PERIOD = 33_333_333
 _EXPORT_STACK = pytest.mark.skipif(
     os.environ.get("FRANKA_TEST_EXPORT") != "1", reason="optional LeRobot stack"
 )
 
 
-def raw_episode(root, *, dual=True, right_offset=None, robot_period=5_000_000):
+def raw_episode(
+    root,
+    *,
+    dual=True,
+    right_offset=None,
+    robot_period=5_000_000,
+    fps=30,
+    right_phase=4_000_000,
+):
     root.mkdir()
     end = _START + 250_000_000
+    period = 1_000_000_000 // fps
     cycles = (
         Cycle("a" * 32, i, stamp - 1_000_000, stamp, (0.2,) * 8, (0.8,) * 8)
-        for i, stamp in enumerate(range(end % robot_period + _START, end + 1, robot_period))
+        for i, stamp in enumerate(
+            range((end - _START) % robot_period + _START, end + 1, robot_period)
+        )
     )
     (root / "robot.jsonl").write_text("".join(json.dumps(c.row()) + "\n" for c in cycles))
     manifest = {
@@ -39,7 +49,7 @@ def raw_episode(root, *, dual=True, right_offset=None, robot_period=5_000_000):
     }
     if dual:
         manifest["cameras"] = ["left", "right"]
-    for role, (width, height), phase in (("left", (8, 6), 0), ("right", (10, 8), 4_000_000)):
+    for role, (width, height), phase in (("left", (8, 6), 0), ("right", (10, 8), right_phase)):
         if not dual and role == "right":
             break
         camera = root / "cameras" / role if dual else root / "camera"
@@ -51,7 +61,7 @@ def raw_episode(root, *, dual=True, right_offset=None, robot_period=5_000_000):
                     "format": "xcore_rgbd_frames_v1",
                     "episode": root.name,
                     "metadata": {
-                        "configuration": {"width": width, "height": height, "fps": 30},
+                        "configuration": {"width": width, "height": height, "fps": fps},
                         "device": {"serial_number": f"synthetic-{role}"},
                         "depth_scale_m_per_unit": 0.001 if role == "left" else 0.002,
                         "depth_format": "z16",
@@ -65,7 +75,7 @@ def raw_episode(root, *, dual=True, right_offset=None, robot_period=5_000_000):
         )
         rows = []
         for seq in range(8):
-            stamp = _START + 5_000_000 + seq * _PERIOD + phase
+            stamp = _START + 5_000_000 + seq * period + phase
             if role == "right" and right_offset:
                 stamp += right_offset(seq)
             rgb, depth = f"rgb/{seq:06d}.png", f"depth/{seq:06d}.png"
@@ -82,8 +92,8 @@ def raw_episode(root, *, dual=True, right_offset=None, robot_period=5_000_000):
                     "received_wall_time_ns": stamp + 100 * _START,
                     "rgb_frame_number": 30 + seq,
                     "depth_frame_number": 30 + seq,
-                    "rgb_sdk_timestamp_ms": 10_000 + seq * _PERIOD / 1e6,
-                    "depth_sdk_timestamp_ms": 10_000 + seq * _PERIOD / 1e6,
+                    "rgb_sdk_timestamp_ms": 10_000 + seq * period / 1e6,
+                    "depth_sdk_timestamp_ms": 10_000 + seq * period / 1e6,
                     "rgb_sdk_timestamp_domain": "hardware_clock",
                     "depth_sdk_timestamp_domain": "hardware_clock",
                 }
@@ -219,3 +229,38 @@ def test_dual_lerobot_export_has_two_videos_and_both_original_depth_streams(tmp_
             depths = dataset_root / camera["depth_image"]
             assert depths.read_bytes() == original.read_bytes()
             assert np.asarray(Image.open(depths)).dtype == np.uint16
+
+
+def test_phase_shifted_15fps_uses_latest_image_for_causal_robot_pairing(tmp_path):
+    root = tmp_path / "phase-shift"
+    manifest = raw_episode(root, fps=15, right_phase=33_000_000, robot_period=12_000_000)
+    manifest["max_skew_ns"] = 35_000_000
+    with pytest.raises(ValueError, match="dual camera/robot clock skew"):
+        analyze(root, manifest)
+    manifest["dual_alignment"] = "latest_camera_causal_v1"
+    publish(root, manifest)
+    episode = read_episode(root)
+    assert episode.report["max_offset_ms"] > 35
+    assert episode.report["max_camera_pair_offset_ms"] == 33
+    assert episode.report["max_robot_to_latest_offset_ms"] < 12
+    assert len(select_frames(episode, 15)) == 4
+    for sample in episode.matched:
+        later = max(f.timestamp_ns for f in sample.frames_by_camera.values())
+        assert sample.target_ns == later
+        assert 0 <= sample.cycle.command_ns - later <= 35_000_000
+
+
+@pytest.mark.parametrize("lag", ["camera", "robot"])
+def test_latest_camera_policy_keeps_independent_skew_limits(tmp_path, lag):
+    root = tmp_path / lag
+    manifest = raw_episode(
+        root,
+        fps=15,
+        right_phase=33_000_000,
+        right_offset=(lambda seq: 3_000_000 * (seq >= 1)) if lag == "camera" else None,
+        robot_period=50_000_000 if lag == "robot" else 12_000_000,
+    )
+    manifest.update(dual_alignment="latest_camera_causal_v1", max_skew_ns=35_000_000)
+    error = "camera clock skew" if lag == "camera" else "latest camera/robot"
+    with pytest.raises(ValueError, match=error):
+        analyze(root, manifest)

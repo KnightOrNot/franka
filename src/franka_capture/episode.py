@@ -6,7 +6,7 @@ import hashlib
 import io
 import json
 import math
-from bisect import bisect_left
+from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -16,6 +16,7 @@ from .telemetry import Cycle
 
 FORMAT = "franka_capture_v1"
 FORMAT_MULTI = "franka_capture_v2"
+DUAL_ALIGNMENT = "latest_camera_causal_v1"
 
 
 def camera_directories(manifest: dict) -> dict[str, Path]:
@@ -299,6 +300,8 @@ def _dual_samples(
     end: int,
     skew: int,
     stale: int,
+    *,
+    latest_causal: bool,
 ) -> tuple[list[Sample], list[int]]:
     rates = {role: camera["configuration"]["fps"] for role, camera in cameras.items()}
     usable = {
@@ -331,20 +334,38 @@ def _dual_samples(
                 (k for k in (i - 1, i) if first <= k < len(stamps)),
                 key=lambda k: abs(stamps[k] - stamp),
             )
-        if abs(stamp - stamps[j]) > skew:
+        if (pair_offset := abs(stamp - stamps[j])) > skew:
+            if latest_causal:
+                raise ValueError(
+                    f"{other} camera clock skew {pair_offset / 1e6:.1f} ms against {anchor} "
+                    f"exceeds {skew / 1e6:g} ms"
+                )
             raise ValueError(f"{other} camera clock skew exceeds the {anchor} camera window")
         low, high = sorted((stamp, stamps[j]))
         first = max(
             previous_cycle + 1, bisect_left(commands, high), bisect_left(observations, start)
         )
-        middle = (low + high) // 2
-        i = bisect_left(observations, middle, lo=first)
-        candidates = [k for k in (i - 1, i) if first <= k < len(cycles)]
+        # The camera pair already passed its own skew check. Match the robot to the
+        # time both frames were available, without counting camera phase twice.
+        target = high if latest_causal else (low + high) // 2
+        last = bisect_right(commands, high + skew, lo=first) if latest_causal else len(cycles)
+        i = bisect_left(observations, target, lo=first, hi=last)
+        candidates = [k for k in (i - 1, i) if first <= k < last]
         if not candidates:
+            if latest_causal:
+                raise ValueError(
+                    f"latest camera/robot has no unused causal command within {skew / 1e6:g} ms"
+                )
             raise ValueError("no unused causal robot cycle for dual camera sample")
-        k = min(candidates, key=lambda k: abs(observations[k] - middle))
+        k = min(candidates, key=lambda k: abs(observations[k] - target))
         error = max(observations[k] - low, high - observations[k])
-        if error > skew:
+        if latest_causal:
+            if (robot_offset := abs(observations[k] - high)) > skew:
+                raise ValueError(
+                    f"latest camera/robot observation skew {robot_offset / 1e6:.1f} ms "
+                    f"exceeds {skew / 1e6:g} ms"
+                )
+        elif error > skew:
             raise ValueError("dual camera/robot clock skew exceeds window")
         selected = {anchor: frame, other: partner[j]}
         matched.append(Sample(selected["left"], cycles[k], high, selected))
@@ -358,6 +379,10 @@ def analyze(root: Path, manifest: dict) -> Episode:
     root = root.resolve(strict=True)
     directories = camera_directories(manifest)
     dual = manifest["format"] == FORMAT_MULTI
+    policy = manifest.get("dual_alignment")
+    if policy is not None and (not dual or policy != DUAL_ALIGNMENT):
+        raise ValueError("unsupported episode alignment policy")
+    latest_causal = policy == DUAL_ALIGNMENT
     start, end = _integer(manifest, "start_ns", 1), _integer(manifest, "end_ns", 1)
     skew = _integer(manifest, "max_skew_ns", 1)
     stale = _integer(manifest, "stale_ns", 1)
@@ -383,7 +408,9 @@ def analyze(root: Path, manifest: dict) -> Episode:
     primary = next(iter(directories))
     frames = camera_frames[primary]
     if dual:
-        matched, errors = _dual_samples(camera_frames, cameras, cycles, start, end, skew, stale)
+        matched, errors = _dual_samples(
+            camera_frames, cameras, cycles, start, end, skew, stale, latest_causal=latest_causal
+        )
     else:
         matched, errors = _single_samples(frames, cycles, start, end, skew)
     if len(matched) < 2:
@@ -409,6 +436,20 @@ def analyze(root: Path, manifest: dict) -> Episode:
         report["excluded_pairs_by_role"] = {
             role: len(stream) - len(matched) for role, stream in camera_frames.items()
         }
+    if latest_causal:
+        pair_ns, observation_ns, command_ns = [], [], []
+        for sample in matched:
+            stamps = tuple(frame.timestamp_ns for frame in sample.frames_by_camera.values())
+            latest = max(stamps)
+            pair_ns.append(latest - min(stamps))
+            observation_ns.append(abs(latest - sample.cycle.observed_ns))
+            command_ns.append(sample.cycle.command_ns - latest)
+        report.update(
+            dual_alignment=policy,
+            max_camera_pair_offset_ms=round(max(pair_ns) / 1e6, 3),
+            max_robot_to_latest_offset_ms=round(max(observation_ns) / 1e6, 3),
+            max_command_after_latest_ms=round(max(command_ns) / 1e6, 3),
+        )
     return Episode(
         root,
         manifest,
@@ -471,9 +512,15 @@ def select_frames(episode: Episode, fps: int) -> tuple[Sample, ...]:
         if abs(stamps[j] - target) > tolerance:
             raise ValueError("uniform export grid has a gap")
         sample = samples[j]
-        if sample.frames_by_camera and any(
-            abs(frame.timestamp_ns - target) > episode.manifest["max_skew_ns"]
-            for frame in sample.frames_by_camera.values()
+        # New episodes are sampled by the later frame of a validated pair. The
+        # older frame's offset from that pair was checked during raw analysis.
+        if (
+            sample.frames_by_camera
+            and episode.manifest.get("dual_alignment") != DUAL_ALIGNMENT
+            and any(
+                abs(frame.timestamp_ns - target) > episode.manifest["max_skew_ns"]
+                for frame in sample.frames_by_camera.values()
+            )
         ):
             raise ValueError("uniform export grid has a dual camera gap")
         selected.append(replace(sample, target_ns=target))

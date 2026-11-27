@@ -1,6 +1,6 @@
 [project]
 name = "franka-capture"
-version = "0.4.1"
+version = "0.4.2"
 description = "Controller-side Franka RGB-D capture and LeRobot dataset export"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"

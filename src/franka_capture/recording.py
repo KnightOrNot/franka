@@ -18,7 +18,7 @@ from uuid import uuid4
 
 from camera_realsense_d435i.manager import CaptureManager
 
-from .episode import FORMAT, FORMAT_MULTI, analyze, atomic_json, camera_directories
+from .episode import DUAL_ALIGNMENT, FORMAT, FORMAT_MULTI, analyze, atomic_json, camera_directories
 from .telemetry import JOINT_NAMES, MAX_OPEN_M, Cycle
 
 
@@ -231,6 +231,7 @@ class Collector:
             }
             if dual:
                 manifest["cameras"] = list(self.cameras)
+                manifest["dual_alignment"] = DUAL_ALIGNMENT
             directories = camera_directories(manifest)
             paths = {
                 role: str(path / directories[role if dual else "front"]) for role in self.cameras

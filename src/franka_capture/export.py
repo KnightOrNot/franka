@@ -173,6 +173,8 @@ def export_episode(path: Path, output: Path, *, fps: int) -> dict:
     cameras = episode.cameras or {"front": episode.camera}
     if episode.cameras:
         report["cameras"] = cameras
+        if episode.manifest.get("dual_alignment"):
+            report["alignment_audit"] = episode.report
     else:
         report["source_depth_scale_m_per_unit"] = episode.camera["depth_scale_m_per_unit"]
     with TemporaryDirectory(prefix=".franka-export-", dir=output.parent) as stage:

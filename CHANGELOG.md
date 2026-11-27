@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.2 — 2026-11-27
+
+- Validate camera-to-camera and latest-frame-to-robot timing separately, so valid asynchronous dual 15 FPS captures can be saved without reusing frames or weakening per-stage timing bounds.
+
 ## 0.4.1 — 2026-11-27
 
 - Confirm and start FR3 follow from the browser after one-time OS authorization at session launch.
