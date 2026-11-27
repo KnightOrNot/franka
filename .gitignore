@@ -10,3 +10,4 @@ config/site.env
 
 /.runtime/
 /third-party/
+/.native/

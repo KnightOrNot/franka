@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.3 — 2026-11-27
+
+- Drain in-flight Franka Hand commands and confirm the SDK disconnect on Ctrl+C or web Stop Follow, without issuing new gripper motion during shutdown.
+- Report hand client startup errors promptly and keep a hardware ownership lease if disconnect cannot be confirmed.
+
 ## 0.4.2 — 2026-11-27
 
 - Validate camera-to-camera and latest-frame-to-robot timing separately, so valid asynchronous dual 15 FPS captures can be saved without reusing frames or weakening per-stage timing bounds.

@@ -115,6 +115,13 @@ pickle 录制开关关闭。不设置此环境变量时仍走原来的跟随路�
 ```bash
 export FRANKA_CAPTURE_CONFIG="$HOME/projects/franka/config/site.env"
 ./scripts/install-session.sh
+
+base="$HOME/projects/franka"
+python3 scripts/build-managed-gripper.py \
+    --teleop-root "$base/third-party/frankateleop" \
+    --sdk-root "$base/third-party/libfranka" \
+    --polymetis-prefix "$base/.runtime/polymetis"
+
 ./scripts/start-session.sh --check
 ```
 
@@ -123,6 +130,8 @@ export FRANKA_CAPTURE_CONFIG="$HOME/projects/franka/config/site.env"
 `1*.sh` 到 `4*.sh` 或先前的 Python 入口。已安装相同内容时重复执行无影响。
 非默认路径可以在 `site.env` 设置 `FRANKA_TELEOP_ROOT`、`FRANKA_CONDA_SH`；
 安装时若用非默认控制树，向安装器也传入 `FRANKA_TELEOP_ROOT`。
+构建命令使用项目内已有的 Polymetis CMake 构建、libfranka 和运行环境，
+仅生成独立客户端 `.native/franka_hand_capture_client`，不会连接机械臂。每个新部署目录构建一次。
 
 第一次替换手动流程时，保存当前回合并正常退出旧数采和 1–4 进程。若有端口冲突，
 `--check` 会报告端口，不会杀掉现有进程。之后每次在工控机终端只运行：
@@ -140,7 +149,9 @@ export FRANKA_CAPTURE_CONFIG="$HOME/projects/franka/config/site.env"
 3. 等遥测和两路相机就绪后，用同一任务名反复开始、保存或丢弃单条 episode。「结束
    数据集并转换」会关闭本批并排队转换，不会停止跟随。「停止跟随」只退出跟随链，
    网页和相机保持运行。不要把网页按钮当急停。退出整次会话前先保存或丢弃，再
-   `Ctrl+C`。
+   `Ctrl+C`，并等待退出完成。两种停止方式都先结束跟随命令链，让已下发的夹爪动作收尾，
+   确认 SDK 连接释放后再关闭夹爪服务。退出不会主动开合、归零或解除夹持力。正常启动
+   的夹爪初始化保持不变。若日志报告未确认断开，先排查 `gripper.log`，不要直接重启跟随。
 4. 遇到失败查看终端上报出的日志路径。日志包含各阶段输出。要回退，退出一键会话后，
    使用原来的 1–4 和 `start-capture.sh`，不需要还原任何控制文件或迁移数据。
 

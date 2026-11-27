@@ -179,7 +179,8 @@ def test_job_control_interrupt_does_not_suspend_supervisor(monkeypatch, tmp_path
     assert session.signal.getsignal(session.signal.SIGTSTP) is old_handler
 
 
-def test_full_sequence_waits_for_feedback_before_next_process(monkeypatch, tmp_path):
+@pytest.mark.parametrize("shutdown", ["web stop", "Ctrl+C"])
+def test_full_sequence_waits_for_feedback_and_gripper_disconnect(monkeypatch, tmp_path, shutdown):
     cfg = session.Config(
         tmp_path, tmp_path, tmp_path, Path("known"), 8078, (0.0,) * 7, tmp_path / "telemetry.sock"
     )
@@ -188,42 +189,72 @@ def test_full_sequence_waits_for_feedback_before_next_process(monkeypatch, tmp_p
     events = []
     spawn = session.spawn
     child_envs = {}
+    procs = {}
 
-    def tracked_spawn(children, name, *args, extra_env=None):
+    def tracked_spawn(children, name, _argv, *args, extra_env=None):
         child_envs[name] = extra_env or {}
-        spawn(children, name, *args, extra_env=extra_env)
+        spawn(children, name, command(cfg, name), *args, extra_env=extra_env)
+        procs[name] = children[-1][1]
 
     monkeypatch.setattr(session, "spawn", tracked_spawn)
+    monkeypatch.setattr(session, "acquire_system_permission", lambda: True)
     monkeypatch.setattr(session, "check_ports", lambda *args, **kwargs: None)
     monkeypatch.setattr(session, "authenticate", lambda *args: events.append("sudo"))
     monkeypatch.setattr(session, "check_children", lambda *args, **kwargs: following.set())
 
     def command(config, name):
-        return [sys.executable, "-c", "import time; time.sleep(60)", name]
+        code = "import time; time.sleep(60)"
+        if name == "gripper":
+            code = (
+                "import signal, sys, time; "
+                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); "
+                'print("hand ready", flush=True); time.sleep(60)'
+            )
+        return [sys.executable, "-c", code, name]
 
-    def ready(children, name, *_args, **_kwargs):
+    def ready(children, name, *_args, logs, **_kwargs):
+        if name == "gripper feedback":
+            deadline = time.monotonic() + 2
+            while "hand ready" not in (logs / "gripper.log").read_text():
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
         events.append((children[-1][0], name))
+
+    def operate(_cfg, _logs, control, _recorder, _permission):
+        client = FollowClient(child_envs["recorder"][FOLLOW_SOCKET_ENV])
+        assert client.start(motion_confirmed=True)["phase"] == "starting"
+        assert following.wait(2)
+        assert control.status()["phase"] == "following"
+        if shutdown == "web stop":
+            client.stop()
+            deadline = time.monotonic() + 2
+            while client.status()["phase"] == "stopping" and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert client.status()["phase"] == "idle"
+            assert session.child_exit(procs["recorder"]) is None
+        raise KeyboardInterrupt
 
     monkeypatch.setattr(session, "robot_command", command)
     monkeypatch.setattr(session, "wait_ready", ready)
-    with FollowControl(
-        lambda attempt: session.run_follow(cfg, tmp_path, attempt), permission_ready=lambda: True
-    ) as control:
-        assert control.start(motion_confirmed=True)["phase"] == "starting"
-        assert following.wait(1)
-        assert control.status()["phase"] == "following"
-        control.stop()
-    assert control.status()["phase"] == "idle"
+    monkeypatch.setattr(session, "operator_loop", operate)
+    with pytest.raises(KeyboardInterrupt):
+        session.run(cfg, tmp_path)
+
+    assert procs["gripper"].returncode == 0
+    assert procs["recorder"].returncode == -session.signal.SIGTERM
     assert child_envs["follow"] == {"FRANKA_CAPTURE_SOCKET": str(cfg.socket_path)}
-    assert all(FOLLOW_SOCKET_ENV not in env for env in child_envs.values())
+    assert all(
+        FOLLOW_SOCKET_ENV not in env for name, env in child_envs.items() if name != "recorder"
+    )
     assert events == [
+        ("recorder", "camera preview"),
         "sudo",
         ("robot", "robot feedback"),
         ("gripper", "gripper feedback"),
         ("node", "FR3 home and node"),
         ("follow", "fresh robot telemetry"),
     ]
-    assert {file.name for file in tmp_path.glob("*.log")} == {
+    assert {file.name for file in tmp_path.glob("follow-*/*.log")} == {
         "robot.log",
         "gripper.log",
         "node.log",
@@ -340,3 +371,40 @@ def test_noninteractive_permission_check_cannot_read_password(monkeypatch):
     assert cmd == ["/usr/bin/sudo", "-n", "-v"]
     assert kwargs["stdin"] == session.subprocess.DEVNULL
     assert kwargs["timeout"] > 0
+
+
+def test_gripper_shutdown_signals_owned_parent_and_waits_for_ack(monkeypatch):
+    events = []
+    monkeypatch.setattr(session, "child_exit", lambda proc: None)
+    monkeypatch.setattr(session.os, "kill", lambda pid, sig: events.append(("pid", pid, sig)))
+    monkeypatch.setattr(session.os, "killpg", lambda pid, sig: events.append(("group", pid, sig)))
+    gripper = Child(48)
+
+    def wait_for_disconnect(timeout):
+        events.append(("gripper_ack", timeout))
+        return 0
+
+    gripper.wait = wait_for_disconnect
+    assert session.stop_owned([("robot", Child(47)), ("gripper", gripper)])
+    assert events == [
+        ("pid", 48, session.signal.SIGTERM),
+        ("gripper_ack", 18),
+        ("group", 47, session.signal.SIGTERM),
+    ]
+
+
+def test_nonzero_gripper_exit_is_not_a_graceful_disconnect(monkeypatch):
+    monkeypatch.setattr(session, "child_exit", lambda proc: None)
+    monkeypatch.setattr(session.os, "kill", lambda pid, sig: None)
+    monkeypatch.setattr(session.os, "killpg", lambda pid, sig: None)
+    assert not session.stop_owned([("gripper", Child(48, exit_code=-session.signal.SIGTERM))])
+
+
+def test_gripper_launch_routes_to_separate_managed_driver(tmp_path):
+    cfg = session.Config(
+        tmp_path, tmp_path, tmp_path, Path("known"), 8078, (0.0,) * 7, tmp_path / "t.sock"
+    )
+    command = session.robot_command(cfg, "gripper")
+    assert str(tmp_path / "scripts/managed_gripper.py") in command
+    assert f"--binary={tmp_path / '.native/franka_hand_capture_client'}" in command
+    assert str(tmp_path / session.POLY / "python/scripts/launch_gripper.py") not in command

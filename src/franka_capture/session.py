@@ -45,7 +45,10 @@ SESSION_INTERRUPTS = (
 ROBOT_PORT, GRIPPER_PORT, NODE_PORT = 50051, 50052, 6001
 POLY = Path("polymetis/polymetis")
 ROBOT = POLY / "python/scripts/launch_robot_capture.py"
-GRIPPER = POLY / "python/scripts/launch_gripper.py"
+GRIPPER_PROFILE = POLY / "conf/gripper/franka_hand.yaml"
+MANAGED_GRIPPER = Path("scripts/managed_gripper.py")
+HAND_BINARY = Path(".native/franka_hand_capture_client")
+HAND_STOP_TIMEOUT = 18
 NODE = Path("teleop/experiments/launch_nodes.py")
 FOLLOW = Path("teleop/experiments/run_env_capture.py")
 FR3 = Path("teleop/teleop/robots/fr3.py")
@@ -141,8 +144,10 @@ def config() -> Config:
         ).resolve()
         if not conda.is_file():
             raise SessionError("conda.sh is missing")
-    if not (teleop / GRIPPER).is_file():
-        raise SessionError(f"root Polymetis checkout is missing: {teleop}")
+    if not (teleop / GRIPPER_PROFILE).is_file():
+        raise SessionError(f"Franka Hand profile is missing: {teleop / GRIPPER_PROFILE}")
+    if not (repo / HAND_BINARY).is_file() or not os.access(repo / HAND_BINARY, os.X_OK):
+        raise SessionError("managed hand client is missing; see docs/deployment.md for its build")
     for path, digest in VERIFIED_SOURCES.items():
         if hashlib.sha256((teleop / path).read_bytes()).hexdigest() != digest:
             raise SessionError(f"unverified root FR3 controller source: {path}")
@@ -232,10 +237,11 @@ def robot_command(cfg: Config, stage: str) -> list[str]:
         ]
     elif stage == "gripper":
         args = [
-            str(cfg.teleop / GRIPPER),
-            "gripper=franka_hand",
-            f"ip={LOOPBACK}",
-            f"port={GRIPPER_PORT}",
+            str(cfg.repo / MANAGED_GRIPPER),
+            f"--config={cfg.teleop / GRIPPER_PROFILE}",
+            f"--binary={cfg.repo / HAND_BINARY}",
+            f"--port={GRIPPER_PORT}",
+            f"--lease={cfg.socket_path.parent / 'gripper.lock'}",
         ]
     elif stage == "node":
         args = [
@@ -306,20 +312,30 @@ def stop_owned(children: Children, *, logs: Path | None = None) -> bool:
             # Already reaped: the PID is no longer safe to use as a group identifier.
             continue
         initial_exit = child_exit(proc)
+        managed_hand = name == "gripper"
+        timeout = HAND_STOP_TIMEOUT if managed_hand else 10
+        target = "process" if managed_hand else "process group"
         try:
-            os.killpg(proc.pid, signal.SIGTERM)
+            if managed_hand:
+                if initial_exit is None:
+                    print(f"{name}: waiting for a clean hardware disconnect{where}", flush=True)
+                    os.kill(proc.pid, signal.SIGTERM)
+            else:
+                os.killpg(proc.pid, signal.SIGTERM)
         except ProcessLookupError:
             pass
         except OSError as exc:
             success = False
             print(
-                f"{name}: could not signal own process group {proc.pid}: {exc}{where}",
+                f"{name}: could not signal own {target} {proc.pid}: {exc}{where}",
                 file=sys.stderr,
                 flush=True,
             )
         try:
-            rc = proc.wait(timeout=10)
-            confirmed_stop = rc in (0, 130, -signal.SIGTERM, 128 + signal.SIGTERM)
+            rc = proc.wait(timeout=timeout)
+            confirmed_stop = (
+                rc == 0 if managed_hand else rc in (0, 130, -signal.SIGTERM, 128 + signal.SIGTERM)
+            )
             if not confirmed_stop and (initial_exit is None or rc == 74):
                 success = False
                 print(
@@ -330,7 +346,7 @@ def stop_owned(children: Children, *, logs: Path | None = None) -> bool:
         except subprocess.TimeoutExpired:
             success = False
             print(
-                f"{name}: did not stop in 10 s (process group {proc.pid}){where}",
+                f"{name}: did not stop in {timeout} s ({target} {proc.pid}){where}",
                 file=sys.stderr,
                 flush=True,
             )
