@@ -7,7 +7,7 @@ import io
 import json
 import math
 from bisect import bisect_left
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PIL import Image
@@ -15,6 +15,18 @@ from PIL import Image
 from .telemetry import Cycle
 
 FORMAT = "franka_capture_v1"
+FORMAT_MULTI = "franka_capture_v2"
+
+
+def camera_directories(manifest: dict) -> dict[str, Path]:
+    """Return the raw camera directories, ordered by their stable roles."""
+    if manifest.get("format") == FORMAT:
+        return {"front": Path("camera")}
+    if manifest.get("format") == FORMAT_MULTI:
+        if manifest.get("cameras") != ["left", "right"]:
+            raise ValueError("dual episode must declare left and right camera roles")
+        return {role: Path("cameras") / role for role in ("left", "right")}
+    raise ValueError("unsupported episode format")
 
 
 def atomic_json(path: Path, value: dict) -> None:
@@ -50,6 +62,7 @@ class Sample:
     frame: FrameRecord
     cycle: Cycle
     target_ns: int
+    frames_by_camera: dict[str, FrameRecord] | None = None
 
 
 @dataclass(frozen=True)
@@ -61,9 +74,11 @@ class Episode:
     cycles: tuple[Cycle, ...]
     matched: tuple[Sample, ...]
     report: dict
+    cameras: dict[str, dict] | None = None
+    camera_frames: dict[str, tuple[FrameRecord, ...]] | None = None
 
 
-def _load(root: Path, relative: str, *, lines: bool = False):
+def _load(root: Path, relative: str | Path, *, lines: bool = False):
     path = _within(root, root / relative)
     if lines:
         with path.open(encoding="utf-8") as stream:
@@ -71,9 +86,9 @@ def _load(root: Path, relative: str, *, lines: bool = False):
     return json.loads(path.read_text("utf-8"))
 
 
-def _media(root: Path, path: str, image_mode: str, size: tuple[int, int], digest) -> None:
+def _media(root: Path, path: Path, image_mode: str, size: tuple[int, int], digest) -> None:
     try:
-        file = _within(root, root / "camera" / path)
+        file = _within(root, root / path)
         data = file.read_bytes()
         digest.update(hashlib.sha256(data).digest())
         with Image.open(io.BytesIO(data)) as image:
@@ -101,9 +116,11 @@ def _sdk_stamp(row: dict, name: str) -> tuple[str, float]:
     return domain, stamp
 
 
-def _frames(root: Path, camera: dict, digest) -> tuple[list[FrameRecord], tuple[str, str]]:
-    complete = _load(root, "camera/COMPLETE.json")
-    rows = _load(root, "camera/frames.jsonl", lines=True)
+def _frames(
+    root: Path, directory: Path, camera: dict, digest
+) -> tuple[list[FrameRecord], tuple[str, str]]:
+    complete = _load(root, directory / "COMPLETE.json")
+    rows = _load(root, directory / "frames.jsonl", lines=True)
     if (
         not rows
         or complete.get("complete") is not True
@@ -142,29 +159,19 @@ def _frames(root: Path, camera: dict, digest) -> tuple[list[FrameRecord], tuple[
             a <= b for a, b in zip(times, previous_times, strict=True)
         ):
             raise ValueError("camera timestamps did not advance")
-        _media(root, rgb, "RGB", size, digest)
-        _media(root, depth, "I;16", size, digest)
+        _media(root, directory / rgb, "RGB", size, digest)
+        _media(root, directory / depth, "I;16", size, digest)
         previous_numbers, previous_domains, previous_times = numbers, domains, times
         frames.append(FrameRecord(seq, rgb, depth, arrived, arrived, arrived))
     assert previous_domains is not None
     return frames, previous_domains
 
 
-def analyze(root: Path, manifest: dict) -> Episode:
-    """Validate camera files and pair whole cycles with images (same host clock)."""
-    root = root.resolve(strict=True)
-    if manifest.get("format") != FORMAT:
-        raise ValueError("unsupported episode format")
-    start, end = _integer(manifest, "start_ns", 1), _integer(manifest, "end_ns", 1)
-    skew = _integer(manifest, "max_skew_ns", 1)
-    stale = _integer(manifest, "stale_ns", 1)
-    requested_end = _integer(manifest, "requested_end_ns", 1)
-    if not start < end <= requested_end or requested_end - end > stale:
-        raise ValueError("invalid recording boundaries")
-    camera_manifest = _load(root, "camera/manifest.json")
+def _camera_metadata(root: Path, directory: Path, episode: str) -> dict:
+    camera_manifest = _load(root, directory / "manifest.json")
     if (
         camera_manifest.get("format") != "xcore_rgbd_frames_v1"
-        or camera_manifest.get("episode") != manifest["episode"]
+        or camera_manifest.get("episode") != episode
     ):
         raise ValueError("camera manifest does not belong to this episode")
     camera = camera_manifest["metadata"]
@@ -181,15 +188,32 @@ def analyze(root: Path, manifest: dict) -> Episode:
         )
     ):
         raise ValueError("missing or invalid native depth calibration")
-    digest = hashlib.sha256()
-    for path in (
-        "robot.jsonl",
-        "camera/manifest.json",
-        "camera/frames.jsonl",
-        "camera/COMPLETE.json",
-    ):
-        digest.update(hashlib.sha256(_within(root, root / path).read_bytes()).digest())
-    frames, domains = _frames(root, camera, digest)
+    return camera
+
+
+def camera_metadata(root: Path, manifest: dict) -> dict[str, dict]:
+    """Read and validate metadata without reading any frame media."""
+    cameras = {}
+    serials = set()
+    dual = manifest.get("format") == FORMAT_MULTI
+    for role, directory in camera_directories(manifest).items():
+        try:
+            camera = _camera_metadata(root, directory, manifest["episode"])
+            if dual:
+                serial = camera["device"]["serial_number"]
+                if not isinstance(serial, str) or not serial.strip() or serial in serials:
+                    raise ValueError("camera serial is missing or not distinct")
+                serials.add(serial)
+                _integer(camera["configuration"], "fps", 1)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            if not dual:
+                raise
+            raise ValueError(f"{role} camera metadata: {exc}") from exc
+        cameras[role] = camera
+    return cameras
+
+
+def _cycles(root: Path, start: int, end: int, stale: int, *, dual: bool) -> list[Cycle]:
     cycles = [Cycle.from_row(row) for row in _load(root, "robot.jsonl", lines=True)]
     if len(cycles) < 2:
         raise ValueError("not enough robot telemetry")
@@ -205,8 +229,16 @@ def analyze(root: Path, manifest: dict) -> Episode:
                 or cycle.command_ns <= prev.command_ns
             ):
                 raise ValueError("robot telemetry lost sequence, time order or source epoch")
+            if dual and cycle.command_ns - prev.command_ns > stale:
+                raise ValueError("robot telemetry has a stale interval")
     if cycles[0].command_ns - start > stale or end != cycles[-1].command_ns:
         raise ValueError("robot telemetry did not cover the episode boundaries")
+    return cycles
+
+
+def _single_samples(
+    frames: list[FrameRecord], cycles: list[Cycle], start: int, end: int, skew: int
+) -> tuple[list[Sample], list[int]]:
     observations = [cycle.observed_ns for cycle in cycles]
     commands = [cycle.command_ns for cycle in cycles]
     usable = [f for f in frames if start <= min(f.rgb_ns, f.depth_ns) <= f.timestamp_ns <= end]
@@ -232,6 +264,128 @@ def analyze(root: Path, manifest: dict) -> Episode:
             raise ValueError(f"camera/robot clock skew exceeds window at frame {frame.seq}")
         errors.append(error)
         matched.append(Sample(frame, cycle, anchor))
+    return matched, errors
+
+
+def _dual_stream(
+    frames: list[FrameRecord], start: int, end: int, stale: int, fps: int, role: str
+) -> list[FrameRecord]:
+    usable = [f for f in frames if start <= f.timestamp_ns <= end]
+    nominal = 1_000_000_000 / fps
+    gap = min(stale, 1.8 * nominal)
+    if (
+        len(usable) < 2
+        or usable[0].timestamp_ns - start > gap
+        or end - usable[-1].timestamp_ns > gap
+        or any(
+            after.timestamp_ns - before.timestamp_ns > gap
+            for before, after in zip(usable, usable[1:], strict=False)
+        )
+    ):
+        raise ValueError(f"{role} camera stream is missing, stale or has a frame gap")
+    # Use host receipt for matching, but reject sustained drift from the recorded profile.
+    intervals = len(usable) - 1
+    elapsed = usable[-1].timestamp_ns - usable[0].timestamp_ns
+    if abs(elapsed - intervals * nominal) > max(0.5 * nominal, 0.03 * intervals * nominal):
+        raise ValueError(f"{role} camera receive cadence drifted from its configured FPS")
+    return usable
+
+
+def _dual_samples(
+    frames: dict[str, list[FrameRecord]],
+    cameras: dict[str, dict],
+    cycles: list[Cycle],
+    start: int,
+    end: int,
+    skew: int,
+    stale: int,
+) -> tuple[list[Sample], list[int]]:
+    rates = {role: camera["configuration"]["fps"] for role, camera in cameras.items()}
+    usable = {
+        role: _dual_stream(stream, start, end, stale, rates[role], role)
+        for role, stream in frames.items()
+    }
+    anchor, other = sorted(rates, key=rates.__getitem__)
+    partner = usable[other]
+    stamps = [frame.timestamp_ns for frame in partner]
+    edge = 500_000_000 / rates[other]
+    same_rate = rates[anchor] == rates[other]
+    observations = [cycle.observed_ns for cycle in cycles]
+    commands = [cycle.command_ns for cycle in cycles]
+    matched = []
+    errors = []
+    previous_frame = previous_cycle = -1
+    for frame in usable[anchor]:
+        stamp = frame.timestamp_ns
+        if stamp < stamps[0] - edge or stamp > stamps[-1] + edge:
+            continue  # Independent camera starts and stops can straddle a sample boundary.
+        first = previous_frame + 1
+        if first == len(stamps):
+            raise ValueError(f"{other} camera ran out of frames during alignment")
+        if same_rate and previous_frame >= 0:
+            # At equal rates preserve ordinal correspondence through arrival jitter.
+            j = first
+        else:
+            i = bisect_left(stamps, stamp, lo=first)
+            j = min(
+                (k for k in (i - 1, i) if first <= k < len(stamps)),
+                key=lambda k: abs(stamps[k] - stamp),
+            )
+        if abs(stamp - stamps[j]) > skew:
+            raise ValueError(f"{other} camera clock skew exceeds the {anchor} camera window")
+        low, high = sorted((stamp, stamps[j]))
+        first = max(
+            previous_cycle + 1, bisect_left(commands, high), bisect_left(observations, start)
+        )
+        middle = (low + high) // 2
+        i = bisect_left(observations, middle, lo=first)
+        candidates = [k for k in (i - 1, i) if first <= k < len(cycles)]
+        if not candidates:
+            raise ValueError("no unused causal robot cycle for dual camera sample")
+        k = min(candidates, key=lambda k: abs(observations[k] - middle))
+        error = max(observations[k] - low, high - observations[k])
+        if error > skew:
+            raise ValueError("dual camera/robot clock skew exceeds window")
+        selected = {anchor: frame, other: partner[j]}
+        matched.append(Sample(selected["left"], cycles[k], high, selected))
+        errors.append(error)
+        previous_frame, previous_cycle = j, k
+    return matched, errors
+
+
+def analyze(root: Path, manifest: dict) -> Episode:
+    """Validate camera files and pair whole cycles with images on the host clock."""
+    root = root.resolve(strict=True)
+    directories = camera_directories(manifest)
+    dual = manifest["format"] == FORMAT_MULTI
+    start, end = _integer(manifest, "start_ns", 1), _integer(manifest, "end_ns", 1)
+    skew = _integer(manifest, "max_skew_ns", 1)
+    stale = _integer(manifest, "stale_ns", 1)
+    requested_end = _integer(manifest, "requested_end_ns", 1)
+    if not start < end <= requested_end or requested_end - end > stale:
+        raise ValueError("invalid recording boundaries")
+    cameras = camera_metadata(root, manifest)
+    digest = hashlib.sha256()
+    digest.update(hashlib.sha256(_within(root, root / "robot.jsonl").read_bytes()).digest())
+    camera_frames, camera_domains = {}, {}
+    for role, directory in directories.items():
+        try:
+            for file in ("manifest.json", "frames.jsonl", "COMPLETE.json"):
+                path = _within(root, root / directory / file)
+                digest.update(hashlib.sha256(path.read_bytes()).digest())
+            camera_frames[role], domains = _frames(root, directory, cameras[role], digest)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            if not dual:
+                raise
+            raise ValueError(f"{role} camera recording: {exc}") from exc
+        camera_domains[role] = dict(zip(("rgb", "depth"), domains, strict=True))
+    cycles = _cycles(root, start, end, stale, dual=dual)
+    primary = next(iter(directories))
+    frames = camera_frames[primary]
+    if dual:
+        matched, errors = _dual_samples(camera_frames, cameras, cycles, start, end, skew, stale)
+    else:
+        matched, errors = _single_samples(frames, cycles, start, end, skew)
     if len(matched) < 2:
         raise ValueError("not enough aligned RGB-D and robot observations")
     errors.sort()
@@ -243,12 +397,29 @@ def analyze(root: Path, manifest: dict) -> Episode:
         "max_offset_ms": round(errors[-1] / 1e6, 3),
         "p95_offset_ms": round(errors[math.ceil(0.95 * len(errors)) - 1] / 1e6, 3),
         "image_clock": "host_receive",
-        "camera_sdk_domains": dict(zip(("rgb", "depth"), domains, strict=True)),
+        "camera_sdk_domains": camera_domains if dual else camera_domains[primary],
         "exposure_time_uncertainty_ns": None,
         "robot_clock": "host_receive",
         "content_sha256": digest.hexdigest(),
     }
-    return Episode(root, manifest, camera, tuple(frames), tuple(cycles), tuple(matched), report)
+    if dual:
+        report["camera_pairs_by_role"] = {
+            role: len(stream) for role, stream in camera_frames.items()
+        }
+        report["excluded_pairs_by_role"] = {
+            role: len(stream) - len(matched) for role, stream in camera_frames.items()
+        }
+    return Episode(
+        root,
+        manifest,
+        cameras[primary],
+        tuple(frames),
+        tuple(cycles),
+        tuple(matched),
+        report,
+        cameras if dual else None,
+        {role: tuple(stream) for role, stream in camera_frames.items()} if dual else None,
+    )
 
 
 def read_episode(path: Path) -> Episode:
@@ -265,13 +436,16 @@ def read_episode(path: Path) -> Episode:
 
 
 def select_frames(episode: Episode, fps: int) -> tuple[Sample, ...]:
-    camera_fps = episode.camera["configuration"]["fps"]
+    cameras = getattr(episode, "cameras", None)  # Existing single-camera callers may duck-type.
+    camera_fps = min(
+        c["configuration"]["fps"] for c in (cameras or {"front": episode.camera}).values()
+    )
     if type(fps) is not int or not 1 <= fps <= camera_fps:
         raise ValueError(
             "dataset FPS must be positive and no greater than the configured camera FPS"
         )
     samples = episode.matched
-    stamps = [s.frame.timestamp_ns for s in samples]
+    stamps = [s.target_ns if cameras else s.frame.timestamp_ns for s in samples]
     selected = []
     previous = -1
     tolerance = min(500_000_000 // fps, episode.manifest["max_skew_ns"])
@@ -296,7 +470,13 @@ def select_frames(episode: Episode, fps: int) -> tuple[Sample, ...]:
         j = min(eligible, key=lambda k: abs(stamps[k] - target))
         if abs(stamps[j] - target) > tolerance:
             raise ValueError("uniform export grid has a gap")
-        selected.append(Sample(samples[j].frame, samples[j].cycle, target))
+        sample = samples[j]
+        if sample.frames_by_camera and any(
+            abs(frame.timestamp_ns - target) > episode.manifest["max_skew_ns"]
+            for frame in sample.frames_by_camera.values()
+        ):
+            raise ValueError("uniform export grid has a dual camera gap")
+        selected.append(replace(sample, target_ns=target))
         previous = j
     if len(selected) < 2:
         raise ValueError("not enough samples on the export grid")

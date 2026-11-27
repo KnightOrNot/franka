@@ -1,10 +1,14 @@
+import sys
+import time
 from pathlib import Path
 from subprocess import TimeoutExpired
+from threading import Event
 from types import SimpleNamespace
 
 import pytest
 
 from franka_capture import session
+from franka_capture.follow_control import FOLLOW_SOCKET_ENV, FollowClient, FollowControl
 
 
 def test_leader_selection_requires_one_matching_live_device(tmp_path):
@@ -43,6 +47,7 @@ class Child:
 def test_shutdown_signals_only_session_groups_in_reverse_order(monkeypatch):
     events = []
     monkeypatch.setattr(session.os, "killpg", lambda pid, sig: events.append((pid, sig)))
+    monkeypatch.setattr(session, "child_exit", lambda proc: None)
     children = [
         ("recorder", Child(33)),
         ("robot", Child(34, stuck=True)),
@@ -56,8 +61,10 @@ def test_shutdown_signals_only_session_groups_in_reverse_order(monkeypatch):
     ]
 
 
-def test_failure_before_first_hardware_stage_stops_only_recorder(monkeypatch, tmp_path):
-    config = SimpleNamespace(repo=tmp_path, teleop=tmp_path, port=8078)
+def test_recorder_readiness_failure_does_not_start_follow(monkeypatch, tmp_path):
+    config = session.Config(
+        tmp_path, tmp_path, tmp_path, Path("known"), 8078, (0.0,) * 7, tmp_path / "t.sock"
+    )
     started = []
     stopped = []
 
@@ -70,7 +77,9 @@ def test_failure_before_first_hardware_stage_stops_only_recorder(monkeypatch, tm
 
     monkeypatch.setattr(session, "spawn", spawn)
     monkeypatch.setattr(session, "wait_ready", failed)
-    monkeypatch.setattr(session, "stop_owned", lambda children: stopped.extend(children) or True)
+    monkeypatch.setattr(
+        session, "stop_owned", lambda children, **_: stopped.extend(children) or True
+    )
     with pytest.raises(session.SessionError, match="camera unavailable"):
         session.run(config, tmp_path)
     assert started == ["recorder"]
@@ -81,6 +90,7 @@ def test_failed_robot_feedback_never_runs_gripper_or_follow(monkeypatch, tmp_pat
     config = SimpleNamespace(repo=tmp_path, teleop=tmp_path, port=8078)
     started = []
     stopped = []
+    finished = Event()
 
     def spawn(children, name, *args, **kwargs):
         started.append(name)
@@ -93,11 +103,24 @@ def test_failed_robot_feedback_never_runs_gripper_or_follow(monkeypatch, tmp_pat
     monkeypatch.setattr(session, "spawn", spawn)
     monkeypatch.setattr(session, "wait_ready", ready)
     monkeypatch.setattr(session, "robot_command", lambda *args: ["fake"])
-    monkeypatch.setattr(session, "probe", lambda *args: None)
-    monkeypatch.setattr(session, "stop_owned", lambda children: stopped.extend(children) or True)
-    with pytest.raises(session.SessionError, match="no robot feedback"):
-        session.run(config, tmp_path)
-    assert started == ["recorder", "robot"]
+    monkeypatch.setattr(session, "check_ports", lambda *args, **kwargs: None)
+    monkeypatch.setattr(session, "authenticate", lambda *args: None)
+    monkeypatch.setattr(
+        session, "stop_owned", lambda children, **_: stopped.extend(children) or True
+    )
+
+    def workflow(attempt):
+        try:
+            session.run_follow(config, tmp_path, attempt)
+        finally:
+            finished.set()
+
+    with FollowControl(workflow, terminal_ready=lambda: True) as control:
+        control.start()
+        assert control.confirm(control.prompt())
+        assert finished.wait(1)
+    assert control.status() == {"phase": "error", "detail": "no robot feedback"}
+    assert started == ["robot"]
     assert [name for name, _ in stopped] == started
 
 
@@ -133,64 +156,143 @@ def test_preflight_does_not_start_programs(monkeypatch, tmp_path, capsys):
     assert "90 mm" in capsys.readouterr().out
 
 
-def test_cancelling_confirmation_starts_no_children(monkeypatch, tmp_path):
+def test_job_control_interrupt_does_not_suspend_supervisor(monkeypatch, tmp_path):
     cfg = session.Config(
         tmp_path, tmp_path, tmp_path, Path("known"), 8078, (0.0,) * 7, tmp_path / "telemetry.sock"
     )
     monkeypatch.setattr(session.sys, "argv", ["launcher"])
-    monkeypatch.setattr(session.sys.stdin, "isatty", lambda: True)
-    monkeypatch.setattr(session.sys.stdout, "isatty", lambda: True)
     monkeypatch.setattr(session, "config", lambda: cfg)
-    monkeypatch.setattr(session, "check_ports", lambda port: None)
-    monkeypatch.setattr("builtins.input", lambda prompt: "no")
+    monkeypatch.setattr(session, "check_ports", lambda _port: None)
+    old_handler = session.signal.getsignal(session.signal.SIGTSTP)
 
-    def unexpected(*args, **kwargs):
-        pytest.fail("cancellation started a program")
+    def interrupted(*_):
+        assert (
+            session.signal.getsignal(session.signal.SIGTSTP) is session.signal.default_int_handler
+        )
+        session.signal.raise_signal(session.signal.SIGTSTP)
+        pytest.fail("terminal job control did not interrupt the session")
 
-    monkeypatch.setattr(session.subprocess, "run", unexpected)
-    monkeypatch.setattr(session, "run", unexpected)
-    assert session.main() == 0
+    monkeypatch.setattr(session, "run", interrupted)
+    assert session.main() == 130
+    assert session.signal.getsignal(session.signal.SIGTSTP) is old_handler
 
 
 def test_full_sequence_waits_for_feedback_before_next_process(monkeypatch, tmp_path):
     cfg = session.Config(
         tmp_path, tmp_path, tmp_path, Path("known"), 8078, (0.0,) * 7, tmp_path / "telemetry.sock"
     )
+    following = Event()
+    (tmp_path / session.POLY / "python/polymetis").mkdir(parents=True)
     events = []
+    spawn = session.spawn
+    child_envs = {}
 
-    def spawn(children, name, *args):
-        events.append(name)
-        children.append((name, Child(len(children) + 1)))
+    def tracked_spawn(children, name, *args, extra_env=None):
+        child_envs[name] = extra_env or {}
+        spawn(children, name, *args, extra_env=extra_env)
 
-    monkeypatch.setattr(session, "spawn", spawn)
-    monkeypatch.setattr(
-        session, "wait_ready", lambda children, name, seconds, ready: events.append(name)
+    monkeypatch.setattr(session, "spawn", tracked_spawn)
+    monkeypatch.setattr(session, "check_ports", lambda *args, **kwargs: None)
+    monkeypatch.setattr(session, "authenticate", lambda *args: events.append("sudo"))
+    monkeypatch.setattr(session, "check_children", lambda *args, **kwargs: following.set())
+
+    def command(config, name):
+        return [sys.executable, "-c", "import time; time.sleep(60)", name]
+
+    def ready(children, name, *_args, **_kwargs):
+        events.append((children[-1][0], name))
+
+    monkeypatch.setattr(session, "robot_command", command)
+    monkeypatch.setattr(session, "wait_ready", ready)
+    with FollowControl(
+        lambda attempt: session.run_follow(cfg, tmp_path, attempt), terminal_ready=lambda: True
+    ) as control:
+        assert control.start()["phase"] == "awaiting_confirmation"
+        assert not list(tmp_path.glob("*.log"))
+        assert control.confirm(control.prompt())
+        assert following.wait(1)
+        assert control.status()["phase"] == "following"
+        control.stop()
+    assert control.status()["phase"] == "idle"
+    assert child_envs["follow"] == {"FRANKA_CAPTURE_SOCKET": str(cfg.socket_path)}
+    assert all(FOLLOW_SOCKET_ENV not in env for env in child_envs.values())
+    assert events == [
+        "sudo",
+        ("robot", "robot feedback"),
+        ("gripper", "gripper feedback"),
+        ("node", "FR3 home and node"),
+        ("follow", "fresh robot telemetry"),
+    ]
+    assert {file.name for file in tmp_path.glob("*.log")} == {
+        "robot.log",
+        "gripper.log",
+        "node.log",
+        "follow.log",
+    }
+
+
+def test_stop_during_real_readiness_cleans_robot_but_leaves_recorder(monkeypatch, tmp_path):
+    cfg = session.Config(
+        tmp_path, tmp_path, tmp_path, Path("known"), 8078, (0.0,) * 7, tmp_path / "telemetry.sock"
     )
-    monkeypatch.setattr(session, "stop_owned", lambda children: events.append("stopped") or True)
+    (tmp_path / session.POLY / "python/polymetis").mkdir(parents=True)
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    controller_probed = Event()
+    processes = {}
+    argv = [sys.executable, "-c", "import time; time.sleep(60)"]
+    spawn = session.spawn
+    client = None
 
-    def interrupt(children):
+    def synthetic_spawn(children, name, _argv, *args, extra_env=None):
+        nonlocal client
+        if name == "recorder":
+            client = FollowClient(extra_env[FOLLOW_SOCKET_ENV])
+        spawn(children, name, argv, *args, extra_env=extra_env)
+        processes[name] = children[-1][1]
+
+    def not_yet_ready(*_):
+        controller_probed.set()
+        return False
+
+    def operate(_cfg, _logs, control, _recorder):
+        assert client.status()["phase"] == "idle"
+        assert set(processes) == {"recorder"}
+        assert client.start()["phase"] == "awaiting_confirmation"
+        assert set(processes) == {"recorder"}
+        assert control.confirm(control.prompt())
+        assert controller_probed.wait(2)
+        assert client.stop()["phase"] in {"stopping", "idle"}
+        deadline = time.monotonic() + 2
+        while client.status()["phase"] == "stopping" and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert client.status()["phase"] == "idle"
+        assert set(processes) == {"recorder", "robot"}
+        assert processes["robot"].returncode == -session.signal.SIGTERM
+        assert session.child_exit(processes["recorder"]) is None
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(session, "check_children", interrupt)
+    monkeypatch.setattr(session, "foreground_terminal", lambda: True)
+    monkeypatch.setattr(session, "spawn", synthetic_spawn)
+    monkeypatch.setattr(session, "status", lambda _: {"camera_fresh": True})
+    monkeypatch.setattr(session, "operator_loop", operate)
+    monkeypatch.setattr(session, "check_ports", lambda *args, **kwargs: None)
+    monkeypatch.setattr(session, "authenticate", lambda *args: None)
+    monkeypatch.setattr(session, "robot_command", lambda *args: argv)
+    monkeypatch.setattr(session, "probe", not_yet_ready)
     with pytest.raises(KeyboardInterrupt):
-        session.run(cfg, tmp_path)
-    assert events == [
-        "recorder",
-        "D435i frames",
-        "robot",
-        "robot feedback",
-        "gripper",
-        "gripper feedback",
-        "node",
-        "FR3 home and node",
-        "follow",
-        "capture-ready telemetry",
-        "stopped",
-    ]
+        session.run(cfg, logs)
+    assert processes["recorder"].returncode == -session.signal.SIGTERM
+
+
+def test_failed_readiness_reports_role_subphase_timeout_and_log(tmp_path):
+    with pytest.raises(session.SessionError, match=r"robot.*feedback.*0 s.*robot[.]log"):
+        session.wait_ready([], "robot feedback", 0, lambda: False, role="robot", logs=tmp_path)
 
 
 def test_supervisor_detects_owned_cleanup_failure(monkeypatch, capsys):
     monkeypatch.setattr(session.os, "killpg", lambda pid, sig: None)
+    monkeypatch.setattr(session, "child_exit", lambda proc: None)
     assert not session.stop_owned([("robot", Child(34, exit_code=74))])
     assert "74" in capsys.readouterr().err
 

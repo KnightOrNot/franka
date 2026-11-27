@@ -53,7 +53,7 @@ class DatasetStub:
         self.phase = "recording"
         return {"phase": self.phase, "task": task}
 
-    def finish(self, operation):
+    def finish_recording(self, operation):
         self.phase = "idle"
         return {"result": "complete" if operation == "save" else "discarded"}
 
@@ -212,3 +212,44 @@ def test_unconfigured_server_reports_conversion_unavailable(http):
         "job": {"state": "idle", "id": None, "error": None},
     }
     assert request(http, "POST", "/api/export", {"episodes": ["episode-one"]})[0] == 503
+
+
+def test_follow_controls_require_confirmation_and_stay_separate_from_export(http):
+    events = []
+    http.follow = SimpleNamespace(
+        start=lambda: events.append("start") or {"phase": "awaiting_confirmation"},
+        stop=lambda: events.append("stop") or {"phase": "stopping"},
+    )
+    http.datasets.finish_dataset = lambda: {"state": "running", "id": "batch-job"}
+    assert request(http, "POST", "/api/follow/start", {"motion_confirmed": False})[0] == 400
+    assert request(http, "POST", "/api/follow/start", {"motion_confirmed": 1})[0] == 400
+    assert not events
+    assert request(http, "POST", "/api/follow/start", {"motion_confirmed": True})[2] == {
+        "phase": "awaiting_confirmation"
+    }
+    assert request(http, "POST", "/api/dataset/finish", {})[0] == 202
+    assert events == ["start"]
+    assert request(http, "POST", "/api/follow/stop", {})[2] == {"phase": "stopping"}
+    assert events == ["start", "stop"]
+
+
+def test_independent_camera_previews_and_rgbd_share_one_frame(http):
+    frame = SimpleNamespace(color_jpeg=b"left rgb", depth_jpeg=b"left depth")
+    calls = []
+
+    def snap():
+        calls.append("left")
+        return frame
+
+    http.collector.cameras = {
+        "left": SimpleNamespace(frame=snap),
+        "right": SimpleNamespace(
+            frame=lambda: SimpleNamespace(color_jpeg=b"right rgb", depth_jpeg=b"right depth")
+        ),
+    }
+    assert request(http, "GET", "/preview/right/depth.jpg")[2] == b"right depth"
+    assert request(http, "GET", "/preview/left/rgbd.json")[2] == {
+        "color": "bGVmdCByZ2I=",
+        "depth": "bGVmdCBkZXB0aA==",
+    }
+    assert calls == ["left"]

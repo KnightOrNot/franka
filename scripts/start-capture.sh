@@ -2,16 +2,20 @@
 set -euo pipefail
 
 usage() {
-    printf 'Usage: %s [--simulate]\n' "${0##*/}"
+    printf 'Usage: %s [--simulate] [--dual-camera]\n' "${0##*/}"
 }
 
 simulate=false
-case "$#:${1:-}" in
-    0:) ;;
-    1:--simulate) simulate=true ;;
-    1:-h|1:--help) usage; exit 0 ;;
-    *) usage >&2; exit 2 ;;
-esac
+dual_camera=false
+while (($#)); do
+    case "$1" in
+        --simulate) simulate=true ;;
+        --dual-camera) dual_camera=true ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; exit 2 ;;
+    esac
+    shift
+done
 
 repo="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 capture="$repo/.venv/bin/franka-capture"
@@ -27,8 +31,12 @@ cd -- "$repo"
 if "$simulate"; then
     socket="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/franka-capture-sim}"
     socket="${socket:-/tmp/franka-capture-sim-$UID}/telemetry.sock"
-    exec "$capture" serve --simulate "--socket=$socket" \
-        --data-root=data/sim/raw --dataset-root=data/sim/lerobot --port=8079
+    args=(serve --simulate "--socket=$socket"
+        --data-root=data/sim/raw --dataset-root=data/sim/lerobot --port=8079)
+    if "$dual_camera"; then
+        args+=(--dual-camera)
+    fi
+    exec "$capture" "${args[@]}"
 fi
 
 if [[ -e $config || -L $config || -n ${FRANKA_CAPTURE_CONFIG:-} ]]; then
@@ -40,13 +48,24 @@ if [[ -e $config || -L $config || -n ${FRANKA_CAPTURE_CONFIG:-} ]]; then
     source "$config"
 fi
 
+case "${FRANKA_CAPTURE_DUAL_CAMERA:-0}" in
+    0) ;;
+    1) dual_camera=true ;;
+    *) printf 'FRANKA_CAPTURE_DUAL_CAMERA must be 0 or 1.\n' >&2; exit 2 ;;
+esac
+
 args=(serve)
+if "$dual_camera"; then
+    args+=(--dual-camera)
+fi
 add_option() {
     local value="${!1-}"
     [[ -z $value ]] || args+=("$2=$value")
 }
 add_option FRANKA_CAPTURE_SOCKET --socket
 add_option FRANKA_CAPTURE_CAMERA_SERIAL --serial
+add_option FRANKA_CAPTURE_LEFT_SERIAL --left-serial
+add_option FRANKA_CAPTURE_RIGHT_SERIAL --right-serial
 add_option FRANKA_CAPTURE_WIDTH --width
 add_option FRANKA_CAPTURE_HEIGHT --height
 add_option FRANKA_CAPTURE_FPS --camera-fps

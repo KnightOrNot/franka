@@ -141,3 +141,34 @@ def test_install_syncs_locked_operator_dependencies(checkout, tmp_path, override
         "--extra",
         "export",
     ]
+
+
+def test_launch_binds_two_cameras_from_site_settings(checkout, tmp_path):
+    fake_program(checkout / ".venv/bin/franka-capture")
+    (checkout / "config/site.env").write_text(
+        "FRANKA_CAPTURE_DUAL_CAMERA=1\n"
+        "FRANKA_CAPTURE_LEFT_SERIAL=9876\nFRANKA_CAPTURE_RIGHT_SERIAL=1234\n"
+    )
+    assert options(run(checkout, tmp_path, "start-capture.sh"), checkout) == {
+        "--dual-camera": "",
+        "--left-serial": "9876",
+        "--right-serial": "1234",
+    }
+
+
+def test_simulation_dual_flag_does_not_read_hardware_site_settings(checkout, tmp_path):
+    fake_program(checkout / ".venv/bin/franka-capture")
+    (checkout / "config/site.env").write_text("exit 99\n")
+    result = run(checkout, tmp_path, "start-capture.sh", "--simulate", "--dual-camera")
+    args = options(result, checkout)
+    assert "--dual-camera" in args and "--simulate" in args
+    assert "--left-serial" not in args and "--right-serial" not in args
+    assert args["--data-root"] == "data/sim/raw"
+
+
+def test_launch_rejects_an_invalid_dual_camera_setting(checkout, tmp_path):
+    fake_program(checkout / ".venv/bin/franka-capture")
+    result = run(checkout, tmp_path, "start-capture.sh", FRANKA_CAPTURE_DUAL_CAMERA="yes")
+    assert result.returncode != 0
+    assert "FRANKA_CAPTURE_DUAL_CAMERA" in result.stderr
+    assert not result.stdout

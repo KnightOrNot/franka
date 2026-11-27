@@ -137,3 +137,23 @@ def test_closing_rejects_late_requests(service):
         service.start([FIRST])
     with pytest.raises(CaptureError, match="shutting down"):
         service.start_recording("pick")
+
+
+def test_dual_catalog_and_legacy_archive_do_not_mix(service):
+    materialize(service.collector.root, FIRST)
+    dual = materialize(service.collector.root, SECOND)
+    manifest = dual / "manifest.json"
+    m = json.loads(manifest.read_text())
+    m.update(format="franka_capture_v2", cameras=["left", "right"])
+    manifest.write_text(json.dumps(m))
+    for role, fps in (("left", 30), ("right", 15)):
+        folder = dual / "cameras" / role
+        folder.mkdir(parents=True)
+        (folder / "manifest.json").write_text(
+            json.dumps({"metadata": {"configuration": {"fps": fps}}})
+        )
+    new, old = service.catalog()["episodes"]
+    assert new["cameras"] == 2 and new["fps"] == 15
+    assert "cameras" not in old
+    with pytest.raises(ValueError, match="cannot share"):
+        service.start([FIRST, SECOND])

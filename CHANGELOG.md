@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.0 — 2026-11-27
+
+- Record and preview two independent RealSense RGB-D streams and export both to LeRobot.
+- Keep repeated episode saves in a recoverable task batch and convert it without stopping follow.
+- Add web follow controls with per-request local confirmation and English stage diagnostics.
+
 ## 0.3.0 — 2026-11-26
 
 - Supervise the verified root FR3 teleoperation and capture workflow from one foreground command.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -27,8 +28,21 @@ section { padding:1rem; border:1px solid #dce2e5; border-radius:.6rem;
           margin:0 0 1rem; background:white }
 .panes { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,240px),1fr));
          gap:1rem }
-figure { margin:0; min-width:0 }
-img { width:100%; aspect-ratio:4/3; background:#f0f2f4; object-fit:contain }
+figure { margin:0; min-width:0; border:1px solid #e4eaee; border-radius:.55rem;
+         padding:.65rem }
+figure[hidden], img[hidden] { display:none }
+.panel-title { display:flex; align-items:center; justify-content:space-between; gap:.4rem;
+               margin-bottom:.4rem; font-weight:600 }
+.panel-title select { font:inherit; font-size:.88rem; max-width:55%; padding:.2rem }
+.panel-images { display:grid; grid-template-columns:minmax(0,1fr) }
+.panel-images.split { grid-template-columns:repeat(2,minmax(0,1fr)); gap:.2rem }
+img { display:block; width:100%; aspect-ratio:4/3; background:#f0f2f4; object-fit:contain }
+.panel-stats, #telemetry-stats, #follow-detail { font-size:.86rem; color:#4e5d69;
+                                             min-height:1.3em; overflow-wrap:anywhere }
+.follow-controls { border-bottom:1px solid #e4eaee; padding-bottom:.6rem; margin-bottom:.8rem }
+.follow-controls label { display:block }
+#follow-stop { color:#a42230 }
+#finish-batch:not(:disabled) { background:#164d72; color:white; border-color:#164d72 }
 button, input { font:inherit; padding:.55rem .8rem; margin:.25rem .25rem .25rem 0 }
 #task { box-sizing:border-box; max-width:100%; width:22rem }
 button:not(:disabled), label:has(input:not(:disabled)) { cursor:pointer }
@@ -47,24 +61,42 @@ button:not(:disabled), label:has(input:not(:disabled)) { cursor:pointer }
 <main>
 <h1>Franka 数采</h1>
 <section aria-label="预览和录制">
+<div class="follow-controls" aria-label="跟随控制">
+<p id="follow-status" role="status">正在读取跟随状态…</p>
+<label><input id="motion-confirmed" type="checkbox">已确认回零和夹爪动作的范围安全</label>
+<button id="follow-start" disabled>启动跟随</button>
+<button id="follow-stop" disabled>停止跟随</button>
+<p id="follow-detail" role="status"></p>
+</div>
 <p id="status" role="status">正在读取设备状态…</p>
+<p id="telemetry-stats" role="status"></p>
 <div class="panes">
-<figure><img id="color" alt="彩色画面"><figcaption>RGB</figcaption></figure>
-<figure><img id="depth" alt="深度预览"><figcaption>深度预览 · 原生 Z16 另存</figcaption></figure>
+<figure data-panel="left"><figcaption class="panel-title"><span>左相机</span>
+<select aria-label="左相机预览模式"><option value="color">RGB</option>
+<option value="depth">深度</option><option value="rgbd">RGBD</option></select></figcaption>
+<div class="panel-images"><img alt="左相机 RGB"><img alt="左相机深度" hidden></div>
+<p class="panel-stats" role="status">等待相机</p></figure>
+<figure data-panel="right"><figcaption class="panel-title"><span>右相机</span>
+<select aria-label="右相机预览模式"><option value="color">RGB</option>
+<option value="depth">深度</option><option value="rgbd">RGBD</option></select></figcaption>
+<div class="panel-images"><img alt="右相机 RGB"><img alt="右相机深度" hidden></div>
+<p class="panel-stats" role="status">等待相机</p></figure>
 </div>
 <p><label for="task">任务</label>
 <input id="task" maxlength="160" placeholder="例如：抓取并放置方块"></p>
 <button id="record" disabled>开始录制</button>
 <button id="save" disabled>保存</button>
 <button id="discard" disabled>丢弃</button>
+<button id="finish-batch" disabled>结束数据集并转换</button>
+<p id="batch-status" role="status"></p>
 <p id="message" role="status"></p>
 </section>
 <section aria-labelledby="episodes-title">
 <h2 id="episodes-title">已保存回合</h2>
-<p>可勾选同一任务、同一采集模式的多个回合。转换期间不能录制。</p>
+<p>也可以手动转换历史回合。转换期间暂停录制操作，机械臂跟随不会停止。</p>
 <p id="episode-empty" hidden>没有可转换的回合。请先录制并保存。</p>
 <ul id="episode-list"></ul>
-<button id="export" disabled>转换为 LeRobot</button>
+<button id="export" disabled>转换所选回合为 LeRobot</button>
 <p id="dataset-status" role="status">正在读取数据目录…</p>
 </section>
 <section aria-labelledby="datasets-title">
@@ -75,11 +107,17 @@ button:not(:disabled), label:has(input:not(:disabled)) { cursor:pointer }
 </main>
 <script>
 const el = id => document.getElementById(id);
-const endpoints = ["record", "save", "discard", "export"];
+const endpoints = ["record", "save", "discard", "export", "finish-batch"];
 const outcomes = {complete:"已保存", discarded:"已丢弃", failed:"录制失败"};
 const selected = new Set(), options = new Map();
 let capture = null, catalog = null, action = "", updating = false, revision = 0;
-let captureError = "", exportError = "", previewSession = "";
+let captureError = "", exportError = "", followError = "";
+let follow = null, followAction = false;
+const panels = [...document.querySelectorAll("[data-panel]")].map(panel => ({
+  panel, role:panel.dataset.panel, camera:null, key:"", fetching:false,
+  images:[...panel.querySelectorAll("img")], mode:panel.querySelector("select"),
+  stats:panel.querySelector(".panel-stats"), name:panel.querySelector(".panel-title span")
+}));
 let episodeKey = "", datasetKey = "";
 
 function text(id, value) {
@@ -101,15 +139,26 @@ function updateControls() {
   const recording = capture?.phase === "recording";
   const idle = capture?.phase === "idle";
   const exporting = !catalog || catalog.job.state === "running";
-  el("record").disabled = !!action || !capture?.ready || exporting;
+  const batch = catalog?.batch;
+  el("record").disabled = !!action || !capture?.ready || exporting || !!batch?.sealed;
   el("save").disabled = el("discard").disabled = !!action || !recording;
+  el("task").disabled = !!action || !idle || exporting || !!batch?.episodes?.length;
+  text("finish-batch", batch?.sealed && !exporting ? "重试转换" : "结束数据集并转换");
+  el("finish-batch").disabled = !!action || !idle || exporting ||
+    !catalog?.available || !batch?.episodes?.length;
+  const phase = follow?.phase;
+  el("follow-start").disabled = followAction || !el("motion-confirmed").checked ||
+    !["idle", "error"].includes(phase);
+  el("follow-stop").disabled = followAction ||
+    !["awaiting_confirmation", "starting", "following", "error"].includes(phase);
   const selectionBlocked = !!action || !idle || exporting || !catalog?.available;
   el("export").disabled = selectionBlocked || !selected.size;
   const first = options.get(selected.values().next().value)?.episode;
   for (const [id, {input, episode}] of options) {
     input.checked = selected.has(id);
     input.disabled = selectionBlocked || !!first && (
-      episode.task !== first.task || episode.simulated !== first.simulated
+      episode.task !== first.task || episode.simulated !== first.simulated ||
+      (episode.cameras || 1) !== (first.cameras || 1)
     );
   }
 }
@@ -117,6 +166,45 @@ function clearImage(img) {
   const old = img.src;
   img.removeAttribute("src");
   if (old.startsWith("blob:")) URL.revokeObjectURL(old);
+}
+function renderFollow() {
+  const labels = {idle:"待启动", awaiting_confirmation:"请到启动终端确认",
+    starting:"正在启动", following:"跟随中", stopping:"正在停止", error:"跟随异常",
+    unmanaged:"此入口不控制跟随"};
+  text("follow-status", "跟随 · " + (labels[follow?.phase] || "连接中断"));
+  text("follow-detail", followError || (follow ?
+    [follow.detail, follow.log_path].filter(Boolean).join(" · ") : ""));
+}
+function fmtRate(value) {
+  return Number.isFinite(value) ? Number(value).toFixed(1) + " FPS" : "—";
+}
+function size(metadata, config, stream) {
+  const intr = metadata?.[stream + "_intrinsics"];
+  const w = intr?.width ?? config?.width, h = intr?.height ?? config?.height;
+  return w && h ? w + "×" + h : "—";
+}
+function renderPanel(tile, camera, role) {
+  tile.camera = camera;
+  tile.assigned = role;
+  const mode = tile.mode.value;
+  const online = camera?.fresh ?? capture?.camera_fresh;
+  const key = camera && online ? role + "/" + camera.session + "/" + mode : "";
+  if (key !== tile.key) {
+    tile.key = key;
+    for (const img of tile.images) clearImage(img);
+  }
+  tile.images[0].hidden = mode === "depth";
+  tile.images[1].hidden = mode === "color";
+  tile.panel.querySelector(".panel-images").classList.toggle("split", mode === "rgbd");
+  if (!online || !camera) {
+    tile.stats.textContent = camera?.error || "等待相机";
+    return;
+  }
+  const f = camera.observed_fps, m = camera.metadata, c = camera.configuration;
+  tile.stats.textContent = "RGB " + size(m, c, "color") + " · " +
+    fmtRate(f?.color ?? f?.rgb) + "　深度 " + size(m, c, "depth") + " · " +
+    fmtRate(f?.depth) + (Number.isFinite(camera.frame_age_s) ?
+      "　帧龄 " + Math.round(camera.frame_age_s * 1000) + " ms" : "");
 }
 function renderCapture() {
   const s = capture;
@@ -129,18 +217,26 @@ function renderCapture() {
       "　相机 " + (s.camera_fresh ? "在线" : "未就绪") +
       (s.phase === "recording" ? "　关节周期 " + s.robot_cycles : ""));
   }
+  text("telemetry-stats", "遥测 · " + (s?.robot_fresh ? "在线" : "未就绪") +
+    " · " + (Number.isFinite(s?.robot_fps) ? s.robot_fps.toFixed(1) + " Hz" : "— Hz") +
+    (Number.isFinite(s?.robot_age_ms) ? " · 更新时延 " + s.robot_age_ms + " ms" : ""));
+  renderFollow();
   const last = s?.last;
   text("message", captureError || (action === "save" ? "正在检查并保存…" : "") ||
     s?.error || (last ? outcomes[last.result] + " · " + last.path +
-      (last.error ? " · " + last.error : "") : "") || (!s?.camera_fresh && s?.camera.error) || "");
-  const session = s?.camera_fresh ? s.camera.session : "";
-  if (previewSession !== session) {
-    for (const id of ["color", "depth"]) clearImage(el(id));
-    previewSession = session;
+      (last.error ? " · " + last.error : "") : "") || (!s?.camera_fresh && s?.camera?.error) || "");
+  const cameras = s?.cameras || (s?.camera ? {default:s.camera} : {});
+  const single = !!cameras.default;
+  panels[0].name.textContent = single ? "相机" : "左相机";
+  panels[1].panel.hidden = single;
+  for (const tile of panels) {
+    const role = single && tile.role === "left" ? "default" : tile.role;
+    renderPanel(tile, cameras[role], role);
   }
 }
 function entryDetails(item) {
-  return item.frames + " 帧 · " + item.fps + " FPS" + (item.simulated ? " · 模拟" : "");
+  return item.frames + " 帧 · " + item.fps + " FPS" +
+    (item.cameras === 2 ? " · 双相机" : "") + (item.simulated ? " · 模拟" : "");
 }
 function renderEpisodes(episodes) {
   el("episode-list").replaceChildren();
@@ -213,7 +309,14 @@ function renderCatalog() {
       datasetKey = datasets;
     }
   }
-  text("dataset-status", exportError || (action === "export" ? "正在启动转换…" : status));
+  const batch = catalog?.batch;
+  if (batch?.episodes?.length || batch?.pending) el("task").value = batch.task;
+  text("batch-status", batch ? "当前数据集 · " + batch.task + " · 已保存 " +
+    batch.episodes.length + " 条 episode" + (batch.export_id ? " · 正在转换，跟随不停止" :
+      batch.sealed ? " · 已结束录制，等待重试转换" : "") :
+    "录制并保存至少一条 episode 后，可以结束数据集并转换。");
+  const submitting = action === "export" || action === "finish-batch";
+  text("dataset-status", exportError || (submitting ? "正在启动转换…" : status));
 }
 async function update() {
   if (updating || action) return;
@@ -223,6 +326,7 @@ async function update() {
     const [s, d] = await Promise.allSettled([api("status"), api("datasets")]);
     if (requestRevision !== revision) return;
     capture = s.status === "fulfilled" ? s.value : null;
+    if (!followAction) follow = capture?.follow || null;
     catalog = d.status === "fulfilled" ? d.value : null;
     renderCapture();
     renderCatalog();
@@ -240,7 +344,8 @@ async function change(id) {
   }
   action = id;
   revision++;
-  if (id === "export") exportError = "";
+  const conversion = id === "export" || id === "finish-batch";
+  if (conversion) exportError = "";
   else captureError = "";
   updateControls();
   renderCapture();
@@ -248,15 +353,13 @@ async function change(id) {
   try {
     const body = id === "record" ? {task:el("task").value} :
       id === "export" ? {episodes:[...selected]} : {};
-    const result = await api(id, body);
-    if (id === "export") {
+    const result = await api(id === "finish-batch" ? "dataset/finish" : id, body);
+    if (conversion) {
       catalog.job = result;
-      selected.clear();
-    } else {
-      capture = null;
+      if (id === "export") selected.clear();
     }
   } catch (e) {
-    if (id === "export") exportError = e.message;
+    if (conversion) exportError = e.message;
     else captureError = e.message;
   } finally {
     action = "";
@@ -266,24 +369,59 @@ async function change(id) {
   }
 }
 for (const id of endpoints) el(id).onclick = () => change(id);
-for (const id of ["color", "depth"]) {
-  let fetching = false;
+el("motion-confirmed").onchange = updateControls;
+async function changeFollow(start) {
+  const button = el(start ? "follow-start" : "follow-stop");
+  if (followAction || button.disabled) return;
+  followAction = true;
+  followError = "";
+  revision++;
+  updateControls();
+  try {
+    follow = await api(start ? "follow/start" : "follow/stop",
+      start ? {motion_confirmed:el("motion-confirmed").checked} : {});
+    if (start) el("motion-confirmed").checked = false;
+  } catch (e) {
+    followError = e.message;
+  } finally {
+    followAction = false;
+    renderFollow();
+    updateControls();
+    await update();
+  }
+}
+el("follow-start").onclick = () => changeFollow(true);
+el("follow-stop").onclick = () => changeFollow(false);
+function replaceImage(img, value) {
+  const old = img.src;
+  img.src = value;
+  if (old.startsWith("blob:")) URL.revokeObjectURL(old);
+}
+for (const tile of panels) {
+  tile.mode.onchange = () => renderPanel(tile, tile.camera, tile.assigned);
   setInterval(async () => {
-    const session = previewSession;
-    if (!session || document.hidden || fetching) return;
-    fetching = true;
+    const key = tile.key, mode = tile.mode.value;
+    if (!key || document.hidden || tile.fetching || tile.panel.hidden) return;
+    tile.fetching = true;
     try {
-      const response = await fetch("/preview/" + id + ".jpg", {cache:"no-store"});
-      if (!response.ok || session !== previewSession) return;
-      const blob = await response.blob();
-      if (session !== previewSession) return;
-      const img = el(id), old = img.src;
-      img.src = URL.createObjectURL(blob);
-      if (old.startsWith("blob:")) URL.revokeObjectURL(old);
+      const path = "/preview/" + tile.assigned + "/" +
+        (mode === "rgbd" ? "rgbd.json" : mode + ".jpg");
+      const response = await fetch(path, {cache:"no-store"});
+      if (!response.ok || key !== tile.key) return;
+      if (mode === "rgbd") {
+        const images = await response.json();
+        if (key !== tile.key) return;
+        replaceImage(tile.images[0], "data:image/jpeg;base64," + images.color);
+        replaceImage(tile.images[1], "data:image/jpeg;base64," + images.depth);
+      } else {
+        const blob = await response.blob();
+        if (key !== tile.key) return;
+        replaceImage(tile.images[mode === "depth" ? 1 : 0], URL.createObjectURL(blob));
+      }
     } catch {
-      // Device status polling reports disconnections.
-    } finally { fetching = false; }
-  }, 150);
+      // Device status polling reports disconnects.
+    } finally { tile.fetching = false; }
+  }, 170);
 }
 update();
 setInterval(update, 750);
@@ -292,11 +430,15 @@ setInterval(update, 750);
 
 _HOST = re.compile(r"(?:localhost|127\.0\.0\.1)(?::([0-9]{1,5}))?", re.IGNORECASE)
 _DOWNLOAD = re.compile(r"/api/datasets/([A-Za-z0-9_-]{1,128})/download")
+_PREVIEW = re.compile(r"/preview/(default|left|right)/(color\.jpg|depth\.jpg|rgbd\.json)")
 _POST_FIELDS = {
     "/api/record": {"task"},
     "/api/save": set(),
     "/api/discard": set(),
     "/api/export": {"episodes"},
+    "/api/dataset/finish": set(),
+    "/api/follow/start": {"motion_confirmed"},
+    "/api/follow/stop": set(),
 }
 
 
@@ -304,6 +446,8 @@ class DatasetOperations(Protocol):
     def catalog(self) -> dict: ...
     def start(self, ids: list[str]) -> dict: ...
     def start_recording(self, task: str) -> dict: ...
+    def finish_recording(self, operation: str) -> dict: ...
+    def finish_dataset(self) -> dict: ...
     def archive(self, dataset_id: str) -> Path: ...
 
 
@@ -313,8 +457,12 @@ class OperatorServer(ThreadingHTTPServer):
     def __init__(
         self, port: int, collector: Collector, datasets: DatasetOperations | None = None
     ) -> None:
+        from .follow_control import FollowClient
+
         self.collector = collector
         self.datasets = datasets
+        socket_path = os.environ.get("FRANKA_CAPTURE_FOLLOW_SOCKET")
+        self.follow = FollowClient(socket_path) if socket_path else None
         super().__init__(("127.0.0.1", port), OperatorHandler)
 
 
@@ -393,7 +541,10 @@ class OperatorHandler(BaseHTTPRequestHandler):
         if self.path == "/":
             self._respond(200, PAGE.encode(), "text/html; charset=utf-8")
         elif self.path == "/api/status":
-            self._json(200, self.server.collector.status())
+            status = self.server.collector.status()
+            follow = getattr(self.server, "follow", None)
+            status = {**status, "follow": follow.status() if follow else {"phase": "unmanaged"}}
+            self._json(200, status)
         elif self.path == "/api/datasets":
             datasets = self.server.datasets
             try:
@@ -413,16 +564,34 @@ class OperatorHandler(BaseHTTPRequestHandler):
                 self._json(200, catalog)
         elif match := _DOWNLOAD.fullmatch(self.path):
             self._download(match[1])
-        elif self.path in ("/preview/color.jpg", "/preview/depth.jpg"):
-            try:
-                frame = self.server.collector.camera.frame()
-            except RuntimeError as exc:
-                self._json(503, {"error": str(exc)})
+        elif match := _PREVIEW.fullmatch(self.path):
+            cameras = getattr(self.server.collector, "cameras", {})
+            if match[1] not in cameras:
+                self._json(404, {"error": "camera is not configured"})
             else:
-                image = frame.color_jpeg if self.path == "/preview/color.jpg" else frame.depth_jpeg
-                self._respond(200, image, "image/jpeg")
+                self._preview(cameras[match[1]], match[2])
+        elif self.path in ("/preview/color.jpg", "/preview/depth.jpg"):
+            self._preview(self.server.collector.camera, self.path.rsplit("/", 1)[1])
         else:
             self._json(404, {"error": "unknown endpoint"})
+
+    def _preview(self, camera, mode: str) -> None:
+        try:
+            frame = camera.frame()
+        except RuntimeError as exc:
+            self._json(503, {"error": str(exc)})
+            return
+        if mode == "rgbd.json":
+            self._json(
+                200,
+                {
+                    "color": base64.b64encode(frame.color_jpeg).decode("ascii"),
+                    "depth": base64.b64encode(frame.depth_jpeg).decode("ascii"),
+                },
+            )
+        else:
+            image = frame.color_jpeg if mode == "color.jpg" else frame.depth_jpeg
+            self._respond(200, image, "image/jpeg")
 
     def _read_body(self, required: set[str], max_length: int) -> dict:
         sizes = self.headers.get_all("Content-Length", [])
@@ -454,7 +623,24 @@ class OperatorHandler(BaseHTTPRequestHandler):
         collector = self.server.collector
         try:
             body = self._read_body(_POST_FIELDS[self.path], 32 * 1024 if exporting else 2048)
-            if exporting:
+            if self.path in ("/api/follow/start", "/api/follow/stop"):
+                starting = self.path.endswith("/start")
+                if starting and body["motion_confirmed"] is not True:
+                    raise ValueError("explicit motion confirmation is required")
+                follow = getattr(self.server, "follow", None)
+                if not follow:
+                    self._json(404, {"error": "follow control is not configured"})
+                    return
+                try:
+                    result = follow.start() if starting else follow.stop()
+                except RuntimeError as exc:
+                    raise CaptureError(str(exc)) from exc
+            elif self.path == "/api/dataset/finish":
+                if datasets is None:
+                    self._json(503, {"error": "dataset conversion is not configured"})
+                    return
+                result = datasets.finish_dataset()
+            elif exporting:
                 ids = body["episodes"]
                 if (
                     not isinstance(ids, list)
@@ -470,7 +656,8 @@ class OperatorHandler(BaseHTTPRequestHandler):
                 start = datasets.start_recording if datasets is not None else collector.start
                 result = start(body["task"])
             else:
-                result = collector.finish(self.path.rsplit("/", 1)[1])
+                finish = datasets.finish_recording if datasets is not None else collector.finish
+                result = finish(self.path.rsplit("/", 1)[1])
         except (ValueError, RecursionError, TimeoutError) as exc:
             self._json(400, {"error": str(exc)})
         except CaptureError as exc:
@@ -478,4 +665,4 @@ class OperatorHandler(BaseHTTPRequestHandler):
         except OSError as exc:
             self._json(500, {"error": str(exc)})
         else:
-            self._json(202 if exporting else 200, result)
+            self._json(202 if exporting or self.path == "/api/dataset/finish" else 200, result)

@@ -1,4 +1,4 @@
-"""Coordinate robot telemetry and a single D435i writer per operator episode."""
+"""Coordinate robot telemetry and lossless camera writers per operator episode."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import os
 import shutil
 import threading
 import time
+from collections import deque
+from contextlib import ExitStack, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from importlib.metadata import version
@@ -16,7 +18,7 @@ from uuid import uuid4
 
 from camera_realsense_d435i.manager import CaptureManager
 
-from .episode import FORMAT, analyze, atomic_json
+from .episode import FORMAT, FORMAT_MULTI, analyze, atomic_json, camera_directories
 from .telemetry import JOINT_NAMES, MAX_OPEN_M, Cycle
 
 
@@ -29,7 +31,7 @@ class _Active:
     root: Path
     manifest: dict
     stream: TextIO
-    camera_session: str
+    camera_sessions: dict[str, str]
     previous: Cycle | None = None
     count: int = 0
     error: str | None = None
@@ -40,7 +42,7 @@ class Collector:
     def __init__(
         self,
         root: Path,
-        camera: CaptureManager,
+        camera: CaptureManager | dict[str, CaptureManager],
         *,
         simulated: bool,
         min_free_mb: int = 1024,
@@ -55,9 +57,19 @@ class Collector:
             or not 1 <= max_skew_ms <= stale_ms <= 5000
         ):
             raise ValueError("invalid recording disk, duration or timing configuration")
+        cameras = camera if isinstance(camera, dict) else {"default": camera}
+        if cameras.keys() == {"left", "right"}:
+            serials = {manager.defaults.serial.strip() for manager in cameras.values()}
+            if len(serials) != 2 or not all(serials):
+                raise ValueError("dual capture requires distinct non-empty camera serials")
+            self.cameras = {role: cameras[role] for role in ("left", "right")}
+        elif cameras.keys() == {"default"}:
+            self.cameras = dict(cameras)
+        else:
+            raise ValueError("camera roles must be default or left and right")
+        self.camera = next(iter(self.cameras.values()))
         self.root = root.resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.camera = camera
         self.simulated = simulated
         self.control_revision = control_revision
         self.min_free_mb = min_free_mb
@@ -67,6 +79,7 @@ class Collector:
         self._operator = threading.RLock()
         self._active: _Active | None = None
         self._last_robot: Cycle | None = None
+        self._robot_stamps: deque[int] = deque(maxlen=4096)
         self._last_result: dict | None = None
 
     def ingest(self, cycle: Cycle) -> None:
@@ -77,6 +90,13 @@ class Collector:
                 if active is not None and active.receiving:
                     active.error = active.error or "late or future robot telemetry"
                 return
+            last = self._last_robot
+            if last is not None and (
+                cycle.epoch != last.epoch
+                or not 0 < cycle.command_ns - last.command_ns <= self.stale_ns
+            ):
+                self._robot_stamps.clear()
+            self._robot_stamps.append(cycle.command_ns)
             self._last_robot = cycle
             if not active or not active.receiving or active.error:
                 return
@@ -112,10 +132,24 @@ class Collector:
     def _disk_ok(self) -> bool:
         return shutil.disk_usage(self.root).free >= self.min_free_mb * 1_000_000
 
+    def _camera_message(self, role: str, reason: str) -> str:
+        return f"{role} camera: {reason}" if len(self.cameras) > 1 else reason
+
     def status(self) -> dict:
-        camera = self.camera.status()
-        now = time.monotonic_ns()
+        camera_statuses = {role: manager.status() for role, manager in self.cameras.items()}
+        cameras = {}
+        for role, camera in camera_statuses.items():
+            age = camera["frame_age_s"]
+            fresh = (
+                camera["state"] == "streaming"
+                and age is not None
+                and 0 <= age <= self.stale_ns / 1e9
+            )
+            cameras[role] = {**camera, "fresh": fresh}
+        cam_ok = all(camera["fresh"] for camera in cameras.values())
+        writer_states = {camera["recording"]["state"] for camera in cameras.values()}
         with self._data:
+            now = time.monotonic_ns()
             last_robot = self._last_robot
             age = None if last_robot is None else now - last_robot.command_ns
             robot_ok = (
@@ -123,11 +157,13 @@ class Collector:
                 and 0 <= age <= self.stale_ns
                 and now - last_robot.observed_ns <= self.stale_ns
             )
-            cam_age = camera["frame_age_s"]
-            cam_ok = (
-                camera["state"] == "streaming"
-                and cam_age is not None
-                and 0 <= cam_age <= self.stale_ns / 1e9
+            stamps = self._robot_stamps
+            while stamps and stamps[0] < now - 1_000_000_000:
+                stamps.popleft()
+            robot_fps = (
+                round((len(stamps) - 1) * 1e9 / (stamps[-1] - stamps[0]), 2)
+                if robot_ok and len(stamps) > 1
+                else None
             )
             active = self._active
             return {
@@ -138,19 +174,21 @@ class Collector:
                     and robot_ok
                     and cam_ok
                     and self._disk_ok()
-                    and camera["recording"]["state"] not in ("recording", "stopping")
+                    and not writer_states.intersection(("recording", "stopping"))
                 ),
                 "robot_fresh": robot_ok,
+                "robot_fps": robot_fps,
                 "robot_age_ms": None if age is None else round(age / 1e6, 2),
                 "camera_fresh": cam_ok,
-                "camera": camera,
+                "camera": next(iter(camera_statuses.values())),
+                "cameras": cameras,
                 "episode": active.manifest["episode"] if active else None,
                 "robot_cycles": active.count if active else 0,
                 "error": active.error
                 if active
                 else (
                     "camera writer did not finalize; restart capture after fixing storage"
-                    if camera["recording"]["state"] == "stopping"
+                    if "stopping" in writer_states
                     else None
                 ),
                 "last": self._last_result,
@@ -165,12 +203,13 @@ class Collector:
                 raise CaptureError("an episode is already active")
             if not status["ready"]:
                 raise CaptureError("fresh robot telemetry, live camera and free disk are required")
+            dual = len(self.cameras) > 1
             stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
             episode = f"{stamp}-{uuid4().hex[:12]}"
             path = self.root / f"{episode}.partial"
             path.mkdir(mode=0o700)
             manifest = {
-                "format": FORMAT,
+                "format": FORMAT_MULTI if dual else FORMAT,
                 "episode": episode,
                 "task": task.strip(),
                 "simulated": self.simulated,
@@ -190,30 +229,49 @@ class Collector:
                     "command_timestamp": "immediately before follower API submission",
                 },
             }
+            if dual:
+                manifest["cameras"] = list(self.cameras)
+            directories = camera_directories(manifest)
+            paths = {
+                role: str(path / directories[role if dual else "front"]) for role in self.cameras
+            }
+            sessions = {role: camera["session"] for role, camera in status["cameras"].items()}
             stream = None
             try:
                 atomic_json(path / "manifest.json", manifest)
                 stream = (path / "robot.jsonl").open("x", encoding="utf-8")
-                self.camera.start_recording(
-                    {"directory": str(path / "camera"), "session": episode, "episode": episode}
-                )
+                for role, camera in self.cameras.items():
+                    try:
+                        camera.start_recording(
+                            {"directory": paths[role], "session": episode, "episode": episode}
+                        )
+                    except Exception as exc:
+                        raise CaptureError(self._camera_message(role, str(exc))) from exc
+                with self._data:
+                    manifest.update(start_ns=time.monotonic_ns(), start_wall_ns=time.time_ns())
+                    active = _Active(path, manifest, stream, sessions)
+                    if dual and (failure := self._failure(active, self.status())):
+                        raise CaptureError(failure)
+                    self._active = active
             except Exception as exc:
-                if stream is not None:
-                    stream.close()
                 reason = f"could not start episode: {exc}"
-                try:
-                    current = self.camera.status()["recording"]
-                    if current.get("directory") == str(path / "camera"):
-                        self.camera.stop_recording(complete=False, reason=reason)
-                finally:
+                if stream is not None:
+                    with suppress(OSError):
+                        stream.close()
+                for role, camera in self.cameras.items():
+                    try:
+                        current = camera.status()["recording"]
+                        if current.get("directory") == paths[role]:
+                            camera.stop_recording(complete=False, reason=reason)
+                    except Exception as cleanup_error:
+                        reason += f"; {self._camera_message(role, str(cleanup_error))}"
+                with suppress(OSError):
                     atomic_json(
-                        path / "manifest.json",
-                        {**manifest, "result": "failed", "error": reason},
+                        path / "manifest.json", {**manifest, "result": "failed", "error": reason}
                     )
+                with self._data:
+                    self._last_result = {"result": "failed", "path": str(path), "error": reason}
                 raise CaptureError(reason) from exc
-            with self._data:
-                manifest.update(start_ns=time.monotonic_ns(), start_wall_ns=time.time_ns())
-                self._active = _Active(path, manifest, stream, status["camera"]["session"])
             return self.status()
 
     def poll(self) -> None:
@@ -231,17 +289,19 @@ class Collector:
             return active.error
         if not status["robot_fresh"]:
             return "robot telemetry is stale"
-        if (
-            not status["camera_fresh"]
-            or status["camera"]["session"] != active.camera_session
-            or status["camera"]["recording"]["state"] != "recording"
-        ):
-            camera = status["camera"]
-            return (
-                camera["recording"]["error"]
-                or camera["error"]
-                or "camera recording stopped, changed session or is stale"
-            )
+        for role, camera in status["cameras"].items():
+            if (
+                not camera["fresh"]
+                or camera["session"] != active.camera_sessions[role]
+                or camera["recording"]["state"] != "recording"
+                or camera["recording"].get("episode") != active.manifest["episode"]
+            ):
+                return self._camera_message(
+                    role,
+                    camera["recording"]["error"]
+                    or camera["error"]
+                    or "camera recording stopped, changed session or is stale",
+                )
         if not self._disk_ok():
             return "recording filesystem free space is below its limit"
         if time.monotonic_ns() - active.manifest["start_ns"] >= self.max_ns:
@@ -274,15 +334,19 @@ class Collector:
                     active.stream.close()
             except OSError as exc:
                 save, discarded, reason = False, False, f"robot write failed: {exc}"
-            try:
-                camera_result = self.camera.stop_recording(complete=save, reason=reason)
-                if save and not camera_result["complete"]:
-                    raise CaptureError(camera_result["error"] or "camera did not finish")
-                if save:
-                    result = analyze(active.root, active.manifest)
-                    active.manifest["report"] = result.report
-            except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
-                save, discarded, reason = False, False, str(exc)
+            for role, camera in self.cameras.items():
+                try:
+                    camera_result = camera.stop_recording(complete=save, reason=reason)
+                    if save and not camera_result["complete"]:
+                        raise CaptureError(camera_result["error"] or "camera did not finish")
+                except Exception as exc:
+                    save, discarded = False, False
+                    reason = reason or self._camera_message(role, str(exc))
+            if save:
+                try:
+                    active.manifest["report"] = analyze(active.root, active.manifest).report
+                except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                    save, reason = False, str(exc)
             phase = "complete" if save else "discarded" if discarded else "failed"
             folder = active.root
             active.manifest.update(result=phase, error=reason, robot_cycles=active.count)
@@ -317,8 +381,13 @@ class Collector:
                 if self._active:
                     self.finish("abort", reason="capture service stopped")
             finally:
-                try:
-                    if self.camera.status()["recording"]["state"] == "stopping":
-                        self.camera.stop_recording(complete=False, reason="capture service stopped")
-                finally:
-                    self.camera.stop()
+                with ExitStack() as stack:
+                    for camera in self.cameras.values():
+                        stack.callback(camera.stop)
+                    for camera in self.cameras.values():
+                        if camera.status()["recording"]["state"] == "stopping":
+                            stack.callback(
+                                camera.stop_recording,
+                                complete=False,
+                                reason="capture service stopped",
+                            )

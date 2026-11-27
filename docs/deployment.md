@@ -41,7 +41,9 @@ test -e config/site.env || cp scripts/site.env.example config/site.env
 | 站点变量 | 作用与默认值 |
 | --- | --- |
 | `FRANKA_CAPTURE_SOCKET` | 和桥共用的 Unix socket，父目录由同一用户拥有且仅该用户可访问。未设置时根据用户运行目录选择 |
-| `FRANKA_CAPTURE_CAMERA_SERIAL` | D435i 序列号，建议明确指定 |
+| `FRANKA_CAPTURE_CAMERA_SERIAL` | 单相机模式的 D435i 序列号 |
+| `FRANKA_CAPTURE_DUAL_CAMERA` | 设为 `1` 启用双相机 RGB-D |
+| `FRANKA_CAPTURE_LEFT_SERIAL`、`FRANKA_CAPTURE_RIGHT_SERIAL` | 双模式的左右相机序列号。两项同时指定且不相同，或同时留空以序列号排序识别恰好两个设备 |
 | `FRANKA_CAPTURE_WIDTH`、`FRANKA_CAPTURE_HEIGHT`、`FRANKA_CAPTURE_FPS` | 相机模式，默认 640×480、30 FPS。以实际 USB 链路和设备 profiles 为准 |
 | `FRANKA_CAPTURE_DATA_ROOT` | 原始回合目录，默认 `data/raw` |
 | `FRANKA_CAPTURE_DATASET_ROOT` | 转换结果与 ZIP 的存放目录，默认在原始目录旁的 `lerobot` 目录。例如 `data/raw` 对应 `data/lerobot` |
@@ -67,7 +69,7 @@ ssh -N -o ExitOnForwardFailure=yes -L 127.0.0.1:8078:127.0.0.1:8078 user@control
 ```
 
 在这台电脑的浏览器打开 <http://127.0.0.1:8078>。不需要在控制器上开桌面，也不需要
-把网页暴露到局域网。页面只能控制录制和数据转换，不能使能、停止或移动机械臂。
+把网页暴露到局域网。通过 `start-capture.sh` 打开的页面只控制录制和转换，不控制机械臂。
 
 ## 3. 保留原有遥测桥和跟随启动流程
 
@@ -129,13 +131,15 @@ export FRANKA_CAPTURE_CONFIG="$HOME/projects/franka/config/site.env"
 ./scripts/start-session.sh
 ```
 
-1. 看清终端显示的从臂 home 关节角和夹爪打开动作。确认工作区清空、急停可用、主手
-   已对齐，再输入 `yes`。实时控制按既有配置使用 sudo，可能提示输入工控机密码。
-2. 启动顺序为数采预览、从臂反馈、夹爪反馈、节点、主从跟随。跟随会启动原有
-   25 步对齐。代码只修正启动时主手闭合比例和从臂开度比例的坐标差异，不模拟按压，
-   不移除差值检查、限步或现场使能。主从位置超差时会停止启动。
-3. 等待「遥测和相机已就绪」，再在数采网页填写任务名和录制。结束时先在网页保存
-   或丢弃，再在启动终端按 `Ctrl+C`。网页不提供机械臂启动/停止按钮。
+1. 网页先打开相机预览。看清终端显示的从臂 home 关节角和夹爪打开动作。确认工作区
+   清空、急停可用、主手已对齐后，在网页勾选确认并点击「启动跟随」。然后在同一工控机
+   终端输入提示的 `yes <确认码>`，按需要验证 sudo 密码。
+2. 终端依次报告从臂反馈、夹爪反馈、节点和主从跟随。保留原有 25 步对齐、差值检查和
+   限步。主从位置超差时停止启动。英文 CLI 报告出错阶段和独立日志路径。
+3. 等遥测和两路相机就绪后，用同一任务名反复开始、保存或丢弃单条 episode。「结束
+   数据集并转换」会关闭本批并排队转换，不会停止跟随。「停止跟随」只退出跟随链，
+   网页和相机保持运行。不要把网页按钮当急停。退出整次会话前先保存或丢弃，再
+   `Ctrl+C`。
 4. 遇到失败查看终端上报出的日志路径。日志包含各阶段输出。要回退，退出一键会话后，
    使用原来的 1–4 和 `start-capture.sh`，不需要还原任何控制文件或迁移数据。
 
@@ -147,7 +151,8 @@ export FRANKA_CAPTURE_CONFIG="$HOME/projects/franka/config/site.env"
    同时只运行一个转换任务，转换和录制不能重叠。
 2. **跟随基线。** 现场操作员确认设备和工作空间后，按既有流程启动。比较不录制和
    约 10 秒录制时的跟随周期、超时和相机掉帧，确认夹爪开闭方向、第 7 轴和配对偏差。
-   640×480、30 FPS 的未压缩写盘参考上限约 46 MB/s。实际 PNG 性能需按现场内容实测，
+   每套 640×480、30 FPS RGB-D 的未压缩参考约 46 MB/s，两路约 92 MB/s。
+   实际 PNG 写盘、USB 和相机帧率需按现场内容实测，
    也要为数据集和 ZIP 留足空间。
 3. **检查与回读。** 用 `check` 和 `replay` 核对周期、配对时间和帧数。保存一段、丢弃
    一段，确认丢弃回合不能导出。人工核对深度非零比例和作业视野。CLI 与 ZIP 格式见

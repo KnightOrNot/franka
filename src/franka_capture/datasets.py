@@ -15,7 +15,7 @@ from pathlib import Path
 from tempfile import mkdtemp
 from uuid import uuid4
 
-from .episode import FORMAT
+from .episode import FORMAT, FORMAT_MULTI, atomic_json, camera_directories
 from .recording import CaptureError, Collector
 
 EPISODE_ID = re.compile(r"[0-9]{8}T[0-9]{6}-[0-9a-f]{12}\Z")
@@ -48,6 +48,76 @@ class DatasetService:
         self._work: Path | None = None
         self._closed = False
         self._job: dict = {"state": "idle", "id": None, "error": None}
+        self._batch_path = raw / ".dataset-batch.json"
+        self._batch = self._restore_batch()
+
+    def _restore_batch(self) -> dict | None:
+        if not self._batch_path.exists() and not self._batch_path.is_symlink():
+            return None
+        value = _object(self.collector.root, self._batch_path.name)
+        episodes = value.get("episodes")
+        if (
+            set(value) != {"id", "task", "episodes", "pending", "export_id", "sealed"}
+            or type(value.get("sealed")) is not bool
+            or not isinstance(value["id"], str)
+            or not re.fullmatch(r"[0-9a-f]{32}", value["id"])
+            or not isinstance(value["task"], str)
+            or not 1 <= len(value["task"]) <= 160
+            or not isinstance(episodes, list)
+            or len(episodes) > MAX_EPISODES
+            or not all(isinstance(i, str) and EPISODE_ID.fullmatch(i) for i in episodes)
+            or len(set(episodes)) != len(episodes)
+            or (
+                value["pending"] is not None
+                and (
+                    not isinstance(value["pending"], str)
+                    or not EPISODE_ID.fullmatch(value["pending"])
+                )
+            )
+            or (
+                value["export_id"] is not None
+                and (
+                    not isinstance(value["export_id"], str)
+                    or not DATASET_ID.fullmatch(value["export_id"])
+                )
+            )
+        ):
+            raise ValueError("invalid dataset batch state")
+        return value
+
+    def _store_batch(self, batch: dict | None) -> None:
+        if batch is None:
+            self._batch_path.unlink(missing_ok=True)
+        else:
+            atomic_json(self._batch_path, batch)
+        self._batch = batch
+
+    def _reconcile_batch(self) -> None:
+        batch = self._batch
+        if batch is None:
+            return
+        queued = batch["export_id"]
+        if queued is not None:
+            try:
+                self._dataset(queued)
+            except FileNotFoundError:
+                running = self._process is not None and self._job["id"] == queued
+                if not running:
+                    self._store_batch({**batch, "export_id": None})
+            else:
+                self._store_batch(None)
+            return
+        pending = batch["pending"]
+        if pending and self.collector.status()["phase"] == "idle":
+            episodes = list(batch["episodes"])
+            try:
+                _, info = self._episode(pending)
+            except (OSError, ValueError, KeyError, TypeError):
+                pass  # Failed, incomplete, or deliberately discarded.
+            else:
+                if info["task"] == batch["task"] and pending not in episodes:
+                    episodes.append(pending)
+            self._store_batch({**batch, "episodes": episodes, "pending": None})
 
     def _episode(self, identifier: str) -> tuple[Path, dict]:
         if not isinstance(identifier, str) or not EPISODE_ID.fullmatch(identifier):
@@ -57,23 +127,34 @@ class DatasetService:
             raise ValueError("episode is not in the saved catalog")
         manifest = _object(root, "manifest.json")
         if (
-            manifest.get("format") != FORMAT
+            manifest.get("format") not in (FORMAT, FORMAT_MULTI)
             or manifest.get("result") != "complete"
             or manifest.get("simulated") is not self.collector.simulated
             or manifest.get("episode") != identifier
         ):
             raise ValueError("episode is incomplete or from a different capture mode")
-        config = _object(root, "camera/manifest.json")["metadata"]["configuration"]
-        task, frames, fps = manifest.get("task"), manifest["report"]["matched_pairs"], config["fps"]
-        if not isinstance(task, str) or type(frames) is not int or type(fps) is not int:
+        roles = camera_directories(manifest)
+        rates = tuple(
+            _object(root, str(path / "manifest.json"))["metadata"]["configuration"]["fps"]
+            for path in roles.values()
+        )
+        task, frames = manifest.get("task"), manifest["report"]["matched_pairs"]
+        if (
+            not isinstance(task, str)
+            or type(frames) is not int
+            or not all(type(fps) is int and fps > 0 for fps in rates)
+        ):
             raise ValueError("invalid episode metadata")
-        return root, {
+        item = {
             "id": identifier,
             "task": task,
             "frames": frames,
-            "fps": fps,
+            "fps": min(rates),
             "simulated": self.collector.simulated,
         }
+        if len(roles) > 1:
+            item["cameras"] = len(roles)
+        return root, item
 
     def _dataset(self, identifier: str, parent: Path | None = None) -> tuple[Path, dict]:
         if not isinstance(identifier, str) or not DATASET_ID.fullmatch(identifier):
@@ -138,6 +219,7 @@ class DatasetService:
     def catalog(self) -> dict:
         with self._lock:
             self._reap()
+            self._reconcile_batch()
             episodes, finished = [], []
             for name in sorted(self.collector.root.iterdir(), reverse=True):
                 if EPISODE_ID.fullmatch(name.name):
@@ -156,6 +238,11 @@ class DatasetService:
                 "datasets": finished,
                 "job": dict(self._job),
                 "available": self.available,
+                "batch": (
+                    {**self._batch, "episodes": list(self._batch["episodes"])}
+                    if self._batch
+                    else None
+                ),
             }
 
     def archive(self, identifier: str) -> Path:
@@ -167,11 +254,63 @@ class DatasetService:
             if self._closed:
                 raise CaptureError("capture service is shutting down")
             self._reap()
+            self._reconcile_batch()
             if self._process is not None:
                 raise CaptureError("wait for dataset conversion before recording")
-            return self.collector.start(task)
+            if not isinstance(task, str) or not 1 <= len(task.strip()) <= 160:
+                raise CaptureError("enter a task name (1–160 characters)")
+            task = task.strip()
+            batch = self._batch
+            if batch and batch["sealed"]:
+                raise CaptureError("this dataset is closed; retry conversion before recording")
+            if batch and batch["episodes"] and batch["task"] != task:
+                raise CaptureError("finish the current dataset before changing its task name")
+            if batch and len(batch["episodes"]) >= MAX_EPISODES:
+                raise CaptureError("finish the current dataset: it already has 200 saved episodes")
+            state = self.collector.start(task)
+            ident = state.get("episode")
+            if ident is not None and (
+                not isinstance(ident, str) or not EPISODE_ID.fullmatch(ident)
+            ):
+                self.collector.finish("abort", reason="recorder returned an invalid episode ID")
+                raise CaptureError("recorder returned an invalid episode ID")
+            if batch is None or batch["task"] != task:
+                batch = {
+                    "id": uuid4().hex,
+                    "task": task,
+                    "episodes": [],
+                    "export_id": None,
+                    "sealed": False,
+                }
+            try:
+                self._store_batch({**batch, "pending": ident})
+            except OSError as exc:
+                self.collector.finish("abort", reason="could not persist dataset batch")
+                raise CaptureError(f"could not persist dataset batch: {exc}") from exc
+            return state
 
-    def start(self, identifiers: list[str]) -> dict:
+    def finish_recording(self, operation: str) -> dict:
+        with self._lock:
+            if self._closed:
+                raise CaptureError("capture service is shutting down")
+            result = self.collector.finish(operation)
+            self._reconcile_batch()
+            return result
+
+    def finish_dataset(self) -> dict:
+        with self._lock:
+            if self._closed:
+                raise CaptureError("capture service is shutting down")
+            self._reap()
+            self._reconcile_batch()
+            if self.collector.status()["phase"] != "idle":
+                raise CaptureError("finish recording before ending the dataset")
+            batch = self._batch
+            if batch is None or not batch["episodes"]:
+                raise CaptureError("at least one saved episode is required")
+            return self.start(list(batch["episodes"]), _batch={**batch, "sealed": True})
+
+    def start(self, identifiers: list[str], *, _batch: dict | None = None) -> dict:
         if (
             not isinstance(identifiers, list)
             or not 1 <= len(identifiers) <= MAX_EPISODES
@@ -192,6 +331,8 @@ class DatasetService:
             checked = [self._episode(i) for i in identifiers]
             if len({info["task"] for _, info in checked}) != 1:
                 raise ValueError("select episodes from the same task")
+            if len({info.get("cameras", 1) for _, info in checked}) != 1:
+                raise ValueError("single- and dual-camera episodes cannot share one dataset")
             stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S")
             identifier = f"dataset-{stamp}-{uuid4().hex[:12]}"
             work = Path(mkdtemp(prefix=f".{identifier}.", dir=self.root))
@@ -220,6 +361,8 @@ class DatasetService:
                 *(str(p) for p, _ in checked),
             ]
             try:
+                if _batch is not None:
+                    self._store_batch({**_batch, "export_id": identifier})
                 with log.open("xb") as stream:
                     self._process = subprocess.Popen(
                         cmd,
@@ -231,6 +374,8 @@ class DatasetService:
                     )
             except OSError:
                 shutil.rmtree(work, ignore_errors=True)
+                if _batch is not None:
+                    self._reconcile_batch()
                 raise
             self._work = work
             self._job = {"id": identifier, "state": "running", "error": None}

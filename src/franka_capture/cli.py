@@ -16,9 +16,9 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from .bridge import Sender
-from .camera import make_camera
+from .camera import make_cameras
 from .datasets import DatasetService
-from .episode import read_episode
+from .episode import camera_directories, read_episode
 from .recording import CaptureError, Collector
 from .telemetry import PACKET_LIMIT, Cycle, open_receiver, socket_default
 from .web import OperatorServer
@@ -74,17 +74,20 @@ def _launch(args):
     with ExitStack() as stack:
         stack.enter_context(_recording_lock(root))
         receiver = stack.enter_context(open_receiver(endpoint))
-        camera = make_camera(
+        cameras = make_cameras(
             root,
             simulate=args.simulate,
+            dual_camera=args.dual_camera,
             serial=args.serial,
+            left_serial=args.left_serial,
+            right_serial=args.right_serial,
             width=args.width,
             height=args.height,
             fps=args.camera_fps,
         )
         collector = Collector(
             root,
-            camera,
+            cameras,
             simulated=args.simulate,
             min_free_mb=args.min_free_mb,
             stale_ms=args.stale_ms,
@@ -110,7 +113,8 @@ def _launch(args):
                     worker.join(timeout=2)
 
         stack.callback(stop_workers)
-        camera.start({})
+        for camera in collector.cameras.values():
+            camera.start({})
         for worker in workers:
             worker.start()
         yield collector
@@ -121,7 +125,10 @@ def _start_args(parser):
         "--data-root", type=Path, help="raw directory (different defaults for simulation)"
     )
     parser.add_argument("--socket", type=Path, default=socket_default())
-    parser.add_argument("--serial", default="")
+    parser.add_argument("--serial", default="", help="bind a single D435i camera")
+    parser.add_argument("--dual-camera", action="store_true", help="require two D435i cameras")
+    parser.add_argument("--left-serial", help="bind the left camera in dual mode")
+    parser.add_argument("--right-serial", help="bind the right camera in dual mode")
     parser.add_argument("--width", type=int)
     parser.add_argument("--height", type=int)
     parser.add_argument("--camera-fps", type=int, default=30)
@@ -199,19 +206,29 @@ def run(args) -> dict | None:
             "task": episode.manifest["task"],
             "report": episode.report,
         }
+    directories = camera_directories(episode.manifest)
     for sample in episode.matched:
-        print(
-            json.dumps(
-                {
-                    "timestamp_ns": sample.frame.timestamp_ns,
-                    "rgb": str(episode.root / "camera" / sample.frame.rgb),
-                    "depth": str(episode.root / "camera" / sample.frame.depth),
-                    "state": sample.cycle.state,
-                    "action": sample.cycle.action,
-                    "seq": sample.cycle.seq,
-                }
+        row = {"state": sample.cycle.state, "action": sample.cycle.action, "seq": sample.cycle.seq}
+        if sample.frames_by_camera is None:
+            root = episode.root / directories["front"]
+            row.update(
+                timestamp_ns=sample.frame.timestamp_ns,
+                rgb=str(root / sample.frame.rgb),
+                depth=str(root / sample.frame.depth),
             )
-        )
+        else:
+            row.update(
+                timestamp_ns=sample.target_ns,
+                cameras={
+                    role: {
+                        "timestamp_ns": frame.timestamp_ns,
+                        "rgb": str(episode.root / directories[role] / frame.rgb),
+                        "depth": str(episode.root / directories[role] / frame.depth),
+                    }
+                    for role, frame in sample.frames_by_camera.items()
+                },
+            )
+        print(json.dumps(row))
     return None
 
 
