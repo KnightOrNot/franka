@@ -11,11 +11,12 @@ Use separate RGB-D acquisition and writers. Preview choices are display-only. St
 observed camera rate, dimensions and frame age and the observed robot rate. One missing or stale
 stream blocks new dual recordings and invalidates an active one. Raw v1 remains readable.
 
-The session shell starts the recorder and viewer. A confirmed browser start request only queues
-a local terminal confirmation to start the existing control chain. Stop is available without
-confirmation, applies only to the owned chain, and leaves the page and cameras running. Do not
-change the original controller scripts, enable motion remotely, or introduce a browser control API
-on the standalone capture launcher. All top-level CLI stage, failure, and log-path text is English.
+The session shell starts the recorder and viewer after optional one-time OS authorization.
+The browser displays the configured motion target and an unchecked on-site confirmation.
+An explicitly confirmed request starts the existing control chain. Subsequent starts are
+non-interactive and cannot request an OS password. Stop applies only to the owned chain and
+leaves the page and cameras running. Keep the original controller scripts and the no-motion
+standalone capture launcher. All CLI stage, failure, and log-path text is English.
 
 Retain the project-local runtime and data layout. Test old and new raw/LeRobot paths with synthetic
 cameras, including failures and retry. Verify on the controller without starting physical motion.

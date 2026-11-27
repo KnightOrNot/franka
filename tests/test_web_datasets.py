@@ -47,6 +47,9 @@ class DatasetStub:
         self.job = {"state": "running", "id": "queued-dataset", "error": None}
         return self.job
 
+    def status(self):
+        return {"phase": self.phase}
+
     def start_recording(self, task):
         if self.job["state"] == "running":
             raise CaptureError("conversion in progress")
@@ -217,20 +220,24 @@ def test_unconfigured_server_reports_conversion_unavailable(http):
 def test_follow_controls_require_confirmation_and_stay_separate_from_export(http):
     events = []
     http.follow = SimpleNamespace(
-        start=lambda: events.append("start") or {"phase": "awaiting_confirmation"},
+        start=lambda *, motion_confirmed: events.append(motion_confirmed) or {"phase": "starting"},
         stop=lambda: events.append("stop") or {"phase": "stopping"},
     )
     http.datasets.finish_dataset = lambda: {"state": "running", "id": "batch-job"}
     assert request(http, "POST", "/api/follow/start", {"motion_confirmed": False})[0] == 400
     assert request(http, "POST", "/api/follow/start", {"motion_confirmed": 1})[0] == 400
     assert not events
+    http.collector.phase = "recording"
+    assert request(http, "POST", "/api/follow/start", {"motion_confirmed": True})[0] == 409
+    assert not events
+    http.collector.phase = "idle"
     assert request(http, "POST", "/api/follow/start", {"motion_confirmed": True})[2] == {
-        "phase": "awaiting_confirmation"
+        "phase": "starting"
     }
     assert request(http, "POST", "/api/dataset/finish", {})[0] == 202
-    assert events == ["start"]
+    assert events == [True]
     assert request(http, "POST", "/api/follow/stop", {})[2] == {"phase": "stopping"}
-    assert events == ["start", "stop"]
+    assert events == [True, "stop"]
 
 
 def test_independent_camera_previews_and_rgbd_share_one_frame(http):

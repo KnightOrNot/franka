@@ -63,7 +63,9 @@ button:not(:disabled), label:has(input:not(:disabled)) { cursor:pointer }
 <section aria-label="预览和录制">
 <div class="follow-controls" aria-label="跟随控制">
 <p id="follow-status" role="status">正在读取跟随状态…</p>
-<label><input id="motion-confirmed" type="checkbox">已确认回零和夹爪动作的范围安全</label>
+<p id="motion-target"></p>
+<label><input id="motion-confirmed" type="checkbox" autocomplete="off">
+我在机械臂旁，已确认工作区清空、急停可用，并核对回零和夹爪动作</label>
 <button id="follow-start" disabled>启动跟随</button>
 <button id="follow-stop" disabled>停止跟随</button>
 <p id="follow-detail" role="status"></p>
@@ -148,9 +150,9 @@ function updateControls() {
     !catalog?.available || !batch?.episodes?.length;
   const phase = follow?.phase;
   el("follow-start").disabled = followAction || !el("motion-confirmed").checked ||
-    !["idle", "error"].includes(phase);
+    follow?.start_enabled !== true || !idle || !["idle", "error"].includes(phase);
   el("follow-stop").disabled = followAction ||
-    !["awaiting_confirmation", "starting", "following", "error"].includes(phase);
+    !["starting", "following", "error"].includes(phase);
   const selectionBlocked = !!action || !idle || exporting || !catalog?.available;
   el("export").disabled = selectionBlocked || !selected.size;
   const first = options.get(selected.values().next().value)?.episode;
@@ -168,12 +170,15 @@ function clearImage(img) {
   if (old.startsWith("blob:")) URL.revokeObjectURL(old);
 }
 function renderFollow() {
-  const labels = {idle:"待启动", awaiting_confirmation:"请到启动终端确认",
-    starting:"正在启动", following:"跟随中", stopping:"正在停止", error:"跟随异常",
-    unmanaged:"此入口不控制跟随"};
+  const labels = {idle:"待启动", starting:"正在启动", following:"跟随中",
+    stopping:"正在停止", error:"跟随异常", unmanaged:"此入口不控制跟随"};
   text("follow-status", "跟随 · " + (labels[follow?.phase] || "连接中断"));
+  text("motion-target", Array.isArray(follow?.home_degrees) ?
+    "启动动作 · 回零 [" + follow.home_degrees.map(q => q + "°").join(", ") +
+    "] · 打开夹爪至 " + follow.gripper_open_mm + " mm" : "");
+  const noAuth = follow?.authorized === false ? "本次会话没有系统授权，无法启动跟随。" : "";
   text("follow-detail", followError || (follow ?
-    [follow.detail, follow.log_path].filter(Boolean).join(" · ") : ""));
+    [noAuth, follow.detail, follow.log_path].filter(Boolean).join(" · ") : ""));
 }
 function fmtRate(value) {
   return Number.isFinite(value) ? Number(value).toFixed(1) + " FPS" : "—";
@@ -369,18 +374,20 @@ async function change(id) {
   }
 }
 for (const id of endpoints) el(id).onclick = () => change(id);
+el("motion-confirmed").checked = false;
 el("motion-confirmed").onchange = updateControls;
 async function changeFollow(start) {
   const button = el(start ? "follow-start" : "follow-stop");
   if (followAction || button.disabled) return;
+  const confirmed = el("motion-confirmed").checked;
+  if (start) el("motion-confirmed").checked = false;
   followAction = true;
   followError = "";
   revision++;
   updateControls();
   try {
     follow = await api(start ? "follow/start" : "follow/stop",
-      start ? {motion_confirmed:el("motion-confirmed").checked} : {});
-    if (start) el("motion-confirmed").checked = false;
+      start ? {motion_confirmed:confirmed} : {});
   } catch (e) {
     followError = e.message;
   } finally {
@@ -631,8 +638,14 @@ class OperatorHandler(BaseHTTPRequestHandler):
                 if not follow:
                     self._json(404, {"error": "follow control is not configured"})
                     return
+                if starting and collector.status()["phase"] != "idle":
+                    raise CaptureError("finish the active recording before starting follow")
                 try:
-                    result = follow.start() if starting else follow.stop()
+                    result = (
+                        follow.start(motion_confirmed=body["motion_confirmed"])
+                        if starting
+                        else follow.stop()
+                    )
                 except RuntimeError as exc:
                     raise CaptureError(str(exc)) from exc
             elif self.path == "/api/dataset/finish":

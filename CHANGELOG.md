@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.4.1 — 2026-11-27
+
+- Confirm and start FR3 follow from the browser after one-time OS authorization at session launch.
+
 ## 0.4.0 — 2026-11-27
 
 - Record and preview two independent RealSense RGB-D streams and export both to LeRobot.

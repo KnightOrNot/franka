@@ -9,19 +9,18 @@ import json
 import math
 import os
 import re
-import select
 import signal
 import socket
 import stat
 import subprocess
 import sys
 import tempfile
-import termios
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
+from threading import Event
 
 from .follow_control import (
     FOLLOW_SOCKET_ENV,
@@ -33,6 +32,8 @@ from .follow_control import (
 from .telemetry import socket_default
 
 LOOPBACK = "127.0.0.1"
+SUDO = "/usr/bin/sudo"
+SUDO_RENEW_SECONDS = 15
 SESSION_INTERRUPTS = (
     signal.SIGINT,
     signal.SIGTERM,
@@ -183,6 +184,7 @@ def check_ports(port: int, *, include_capture: bool = True) -> None:
 
 
 def conda_command(cfg: Config, *argv: str) -> list[str]:
+    guard = cfg.repo / "scripts/noninteractive"
     if cfg.polymetis_prefix is not None:
         if argv[0] != "python":
             raise ValueError("local Polymetis commands must use its Python interpreter")
@@ -203,16 +205,18 @@ def conda_command(cfg: Config, *argv: str) -> list[str]:
             "PYTHONNOUSERSITE=1",
             "MKL_INTERFACE_LAYER=LP64,GNU",
             f"CONDA_PREFIX={prefix}",
-            f"PATH={prefix / 'bin'}:{system_path}",
+            f"PATH={guard}:{prefix / 'bin'}:{system_path}",
             str(prefix / "bin/python"),
             *argv[1:],
         ]
     return [
         "bash",
         "-c",
-        'source "$1" && conda activate polymetis || exit 1; shift; exec "$@"',
+        'source "$1" && conda activate polymetis || exit 1; '
+        'export PATH="$2:$PATH"; shift 2; exec "$@"',
         "franka-conda",
         str(cfg.conda),
+        str(guard),
         *argv,
     ]
 
@@ -401,7 +405,7 @@ def status(port: int) -> dict:
 
 
 def wait_auxiliary(proc: subprocess.Popen, seconds: float, attempt: FollowAttempt) -> int | None:
-    """Reap a one-off probe or terminal authentication, including on browser cancellation."""
+    """Reap a one-off probe, including on browser cancellation."""
     deadline = time.monotonic() + seconds
     try:
         while time.monotonic() < deadline:
@@ -446,32 +450,42 @@ def foreground_terminal() -> bool:
         return False
 
 
-def authenticate(logs: Path, attempt: FollowAttempt) -> None:
-    log = logs / "sudo.log"
-    attempt.report(
-        "starting",
-        "Waiting for local sudo authentication (120 s timeout).",
-        stage="sudo",
-        log_path=log,
-    )
-    print(f"sudo: authenticate at this terminal if prompted; log {log}", flush=True)
-    if not foreground_terminal():
-        raise SessionError(f"sudo: the session terminal is no longer in the foreground; log {log}")
+def sudo_ready() -> bool:
+    """Validate/refresh the OS timestamp without prompting or storing credentials."""
     try:
-        with log.open("x") as output:
-            output.write("Authenticating in the operator terminal.\n")
-            output.flush()
-            # Keep sudo's actual stdin and output attached so its prompt remains visible.
-            # It stays in the foreground group. Cancellation signals only this sudo PID.
-            proc = attempt.launch(lambda: subprocess.Popen(["sudo", "-v"]))
-            rc = wait_auxiliary(proc, 120, attempt)
-            print(f"Authentication exit status: {rc if rc is not None else 'timeout'}", file=output)
-    except OSError as exc:
-        raise SessionError(f"sudo: local authentication failed: {exc}; log {log}") from exc
-    if rc is None:
-        raise SessionError(f"sudo: local authentication timed out after 120 s; log {log}")
-    if rc != 0:
-        raise SessionError(f"sudo: local authentication exited ({rc}); log {log}")
+        result = subprocess.run(
+            [SUDO, "-n", "-v"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=3,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def acquire_system_permission() -> bool:
+    if sudo_ready():
+        return True
+    if not foreground_terminal():
+        return False
+    print("Authorize robot control once at launch. After this, use the web page.", flush=True)
+    result = subprocess.run([SUDO, "-v"], check=False)
+    return result.returncode == 0 and sudo_ready()
+
+
+def authenticate(logs: Path, attempt: FollowAttempt) -> None:
+    attempt.check()
+    log = logs / "sudo.log"
+    permitted = sudo_ready()
+    log.write_text(f"Non-interactive system authorization check: {permitted}\n", "utf-8")
+    if not permitted:
+        raise SessionError(
+            f"sudo: authorization is unavailable. Launch a new session to authorize once; log {log}"
+        )
+    attempt.check()
 
 
 def fresh_telemetry(port: int, since: float) -> bool:
@@ -509,7 +523,7 @@ def run_follow(cfg: Config, logs: Path, attempt: FollowAttempt) -> None:
     try:
         check_ports(cfg.port, include_capture=False)
         authenticate(logs, attempt)
-        # Authentication may take time. Check again before starting any session-owned driver.
+        # Recheck the ports before starting any session-owned driver.
         check_ports(cfg.port, include_capture=False)
         for role, name, seconds, directory, ready in stages:
             log = logs / f"{role}.log"
@@ -549,56 +563,44 @@ def show_target(cfg: Config) -> None:
     print(f"Starting follow moves the FR3 to home [{angles}] and opens the gripper (90 mm).")
 
 
-def operator_loop(cfg: Config, logs: Path, control: FollowControl, recorder: Children) -> None:
-    previous_prompt = None
+def operator_loop(
+    cfg: Config, logs: Path, control: FollowControl, recorder: Children, permission: Event
+) -> None:
     previous_state = None
+    renewal = time.monotonic() + SUDO_RENEW_SECONDS
     while True:
         check_children(recorder, logs=logs, subphase="capture preview")
+        if time.monotonic() >= renewal:
+            (permission.set if sudo_ready() else permission.clear)()
+            renewal = time.monotonic() + SUDO_RENEW_SECONDS
         state = control.status()
-        if state != previous_state and state["phase"] != "awaiting_confirmation":
+        if state != previous_state:
             log = f" Log: {state['log_path']}" if "log_path" in state else ""
             print(f"Follow {state['phase']}: {state['detail']}{log}", flush=True)
-        previous_state = state
-        challenge = control.prompt()
-        if not foreground_terminal():
-            if state["phase"] in {"awaiting_confirmation", "starting", "following"}:
-                control.stop()
-            time.sleep(0.1)
-        elif challenge:
-            fd = sys.stdin.fileno()
-            if challenge != previous_prompt:
-                termios.tcflush(fd, termios.TCIFLUSH)
-                show_target(cfg)
+            if not state["authorized"]:
                 print(
-                    f"Check the arm workspace, emergency stop and leader alignment. "
-                    f"Type '{challenge}' to start or 'no' to cancel.",
+                    "System authorization is unavailable; web follow start is disabled.",
                     flush=True,
                 )
-            readable, _, _ = select.select([fd], [], [], 0.1)
-            if readable:
-                line = os.read(fd, 4096)
-                if not line:
-                    control.stop()
-                elif (
-                    not control.confirm(line.decode(errors="replace").strip()) and control.prompt()
-                ):
-                    print(
-                        "Confirmation not accepted. Use the current terminal code or 'no'.",
-                        flush=True,
-                    )
-        else:
-            time.sleep(0.1)
-        previous_prompt = challenge
+        previous_state = state
+        time.sleep(0.1)
 
 
 def run(cfg: Config, logs: Path) -> None:
     recorder: Children = []
+    permission = Event()
+    if acquire_system_permission():
+        permission.set()
 
     def workflow(attempt: FollowAttempt) -> None:
         follow_logs = Path(tempfile.mkdtemp(prefix="follow-", dir=logs))
         run_follow(cfg, follow_logs, attempt)
 
-    control = FollowControl(workflow, terminal_ready=foreground_terminal)
+    control = FollowControl(
+        workflow,
+        permission_ready=permission.is_set,
+        home_degrees=tuple(round(math.degrees(q), 1) for q in cfg.home),
+    )
     try:
         with open_control_socket(cfg.socket_path.parent, control) as endpoint:
             spawn(
@@ -624,7 +626,7 @@ def run(cfg: Config, logs: Path) -> None:
                 f"Capture page: http://{LOOPBACK}:{cfg.port}. No robot motion has started.",
                 flush=True,
             )
-            operator_loop(cfg, logs, control, recorder)
+            operator_loop(cfg, logs, control, recorder, permission)
     finally:
         # Do not let a second Ctrl+C or disconnect interrupt reverse-order cleanup.
         handlers = {sig: signal.signal(sig, signal.SIG_IGN) for sig in SESSION_INTERRUPTS}

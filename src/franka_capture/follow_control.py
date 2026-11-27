@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
 import socket
 import stat
 import tempfile
@@ -16,8 +15,9 @@ from threading import Event, Lock, Thread
 from typing import TypeVar
 
 FOLLOW_SOCKET_ENV = "FRANKA_CAPTURE_FOLLOW_SOCKET"
-_REQUESTS = {b"status\n", b"start\n", b"stop\n"}
-_PHASES = {"idle", "awaiting_confirmation", "starting", "following", "stopping", "error"}
+_REQUESTS = {b"status\n", b"confirmed-start\n", b"stop\n"}
+_PHASES = {"idle", "starting", "following", "stopping", "error"}
+_PERMISSION_ERROR = "System authorization is not available for follow in this session."
 _RESPONSE_LIMIT = 4096
 _T = TypeVar("_T")
 
@@ -73,8 +73,10 @@ class FollowClient:
     def status(self) -> dict:
         return self._request("status")
 
-    def start(self) -> dict:
-        return self._request("start")
+    def start(self, *, motion_confirmed: bool) -> dict:
+        if motion_confirmed is not True:
+            raise RuntimeError("explicit motion confirmation is required")
+        return self._request("confirmed-start")
 
     def stop(self) -> dict:
         return self._request("stop")
@@ -101,8 +103,8 @@ class FollowAttempt:
         # Serialize the cancellation check with the spawn decision, not the readiness wait.
         with self._supervisor._lock:
             self.check()
-            if not self._supervisor._terminal_ready():
-                raise FollowCancelled
+            if not self._supervisor._permission_ready():
+                raise RuntimeError(_PERMISSION_ERROR)
             return spawn()
 
     def report(
@@ -122,18 +124,18 @@ class FollowControl:
         self,
         workflow: Callable[[FollowAttempt], None],
         *,
-        terminal_ready: Callable[[], bool],
+        permission_ready: Callable[[], bool],
+        home_degrees: tuple[float, ...] | None = None,
     ):
         self._workflow = workflow
-        self._terminal_ready = terminal_ready
+        self._permission_ready = permission_ready
+        self._target = tuple(home_degrees) if home_degrees is not None else None
         self._lock = Lock()
         self._attempt: FollowAttempt | None = None
         self._worker: Thread | None = None
-        self._challenge: str | None = None
-        self._expires = 0.0
         self._unsafe = False
         self._closed = False
-        self._set("idle", "Follow is stopped. Use the web page to request a start.")
+        self._set("idle", "Follow is stopped. Confirm the motion on the web page to start.")
 
     def _set(
         self, phase: str, detail: str, stage: str | None = None, log_path: Path | None = None
@@ -144,66 +146,47 @@ class FollowControl:
         if log_path is not None:
             self._state["log_path"] = str(log_path)
 
-    def _expire(self) -> None:
-        if self._challenge and time.monotonic() >= self._expires:
-            self._challenge = None
-            self._set("idle", "Terminal confirmation expired. Request a new start.")
+    def _snapshot(self) -> dict:
+        permitted = self._permission_ready()
+        state = {
+            **self._state,
+            "authorized": permitted,
+            "start_enabled": permitted
+            and self._attempt is None
+            and not (self._closed or self._unsafe),
+        }
+        if self._target is not None:
+            state.update(home_degrees=list(self._target), gripper_open_mm=90)
+        return state
 
     def status(self) -> dict:
         with self._lock:
-            self._expire()
-            return dict(self._state)
+            return self._snapshot()
 
-    def start(self) -> dict:
+    def start(self, *, motion_confirmed: bool) -> dict:
         with self._lock:
-            self._expire()
+            if motion_confirmed is not True:
+                raise RuntimeError("explicit motion confirmation is required")
             if self._closed:
                 raise RuntimeError("The follow supervisor is closing.")
             if self._unsafe:
                 raise RuntimeError(self._state["detail"])
-            if self._attempt is not None or self._challenge is not None:
+            if self._attempt is not None:
                 raise RuntimeError("A follow request is already active.")
-            if not self._terminal_ready():
-                raise RuntimeError(
-                    "Follow requires an on-site operator at the foreground terminal."
-                )
-            self._challenge = "yes " + secrets.token_hex(4)
-            self._expires = time.monotonic() + 90
-            self._set("awaiting_confirmation", "Confirm this request in the session terminal.")
-            return dict(self._state)
-
-    def prompt(self) -> str | None:
-        with self._lock:
-            self._expire()
-            return self._challenge
-
-    def confirm(self, line: str | None) -> bool:
-        with self._lock:
-            self._expire()
-            if self._challenge is None:
-                return False
-            if line == "no" or not self._terminal_ready():
-                self._challenge = None
-                self._set("idle", "Terminal confirmation cancelled. Follow did not start.")
-                return False
-            if line != self._challenge:
-                return False
-            self._challenge = None
+            if not self._permission_ready():
+                raise RuntimeError(_PERMISSION_ERROR)
             attempt = self._attempt = FollowAttempt(self)
-            self._set("starting", "Terminal confirmation accepted. Preparing follow.")
+            self._set("starting", "Web motion confirmation accepted. Preparing follow.")
             self._worker = Thread(target=self._run, args=(attempt,), name="follow-supervisor")
             self._worker.start()
-            return True
+            return self._snapshot()
 
     def stop(self) -> dict:
         with self._lock:
-            if self._challenge is not None:
-                self._challenge = None
-                self._set("idle", "Start request cancelled. Follow did not start.")
             if self._attempt is not None and not self._attempt.cancelled.is_set():
                 self._attempt.cancelled.set()
                 self._set("stopping", "Stopping the session-owned follow chain.")
-            return dict(self._state)
+            return self._snapshot()
 
     def _run(self, attempt: FollowAttempt) -> None:
         failure = None
@@ -243,7 +226,11 @@ def _serve(conn: socket.socket, control: FollowControl) -> None:
         request = _receive_line(conn, 16, 0.2)
         if request not in _REQUESTS:
             raise ValueError("invalid follow control request")
-        handler = {b"status\n": control.status, b"start\n": control.start, b"stop\n": control.stop}
+        handler = {
+            b"status\n": control.status,
+            b"confirmed-start\n": lambda: control.start(motion_confirmed=True),
+            b"stop\n": control.stop,
+        }
         message = handler[request]()
     except (OSError, ValueError, RuntimeError) as exc:
         message = {"ok": False, "detail": str(exc)}

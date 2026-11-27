@@ -75,6 +75,7 @@ def test_recorder_readiness_failure_does_not_start_follow(monkeypatch, tmp_path)
     def failed(*args, **kwargs):
         raise session.SessionError("camera unavailable")
 
+    monkeypatch.setattr(session, "acquire_system_permission", lambda: False)
     monkeypatch.setattr(session, "spawn", spawn)
     monkeypatch.setattr(session, "wait_ready", failed)
     monkeypatch.setattr(
@@ -115,17 +116,18 @@ def test_failed_robot_feedback_never_runs_gripper_or_follow(monkeypatch, tmp_pat
         finally:
             finished.set()
 
-    with FollowControl(workflow, terminal_ready=lambda: True) as control:
-        control.start()
-        assert control.confirm(control.prompt())
+    with FollowControl(workflow, permission_ready=lambda: True) as control:
+        control.start(motion_confirmed=True)
         assert finished.wait(1)
-    assert control.status() == {"phase": "error", "detail": "no robot feedback"}
+    assert control.status()["phase"] == "error"
+    assert control.status()["detail"] == "no robot feedback"
     assert started == ["robot"]
     assert [name for name, _ in stopped] == started
 
 
 def test_follow_stage_is_opt_in_and_uses_root_ports(tmp_path):
     cfg = SimpleNamespace(
+        repo=tmp_path,
         conda=Path("/some conda.sh"),
         polymetis_prefix=None,
         serial=Path("/dev/example"),
@@ -205,11 +207,9 @@ def test_full_sequence_waits_for_feedback_before_next_process(monkeypatch, tmp_p
     monkeypatch.setattr(session, "robot_command", command)
     monkeypatch.setattr(session, "wait_ready", ready)
     with FollowControl(
-        lambda attempt: session.run_follow(cfg, tmp_path, attempt), terminal_ready=lambda: True
+        lambda attempt: session.run_follow(cfg, tmp_path, attempt), permission_ready=lambda: True
     ) as control:
-        assert control.start()["phase"] == "awaiting_confirmation"
-        assert not list(tmp_path.glob("*.log"))
-        assert control.confirm(control.prompt())
+        assert control.start(motion_confirmed=True)["phase"] == "starting"
         assert following.wait(1)
         assert control.status()["phase"] == "following"
         control.stop()
@@ -255,12 +255,10 @@ def test_stop_during_real_readiness_cleans_robot_but_leaves_recorder(monkeypatch
         controller_probed.set()
         return False
 
-    def operate(_cfg, _logs, control, _recorder):
+    def operate(_cfg, _logs, control, _recorder, _permission):
         assert client.status()["phase"] == "idle"
         assert set(processes) == {"recorder"}
-        assert client.start()["phase"] == "awaiting_confirmation"
-        assert set(processes) == {"recorder"}
-        assert control.confirm(control.prompt())
+        assert client.start(motion_confirmed=True)["phase"] == "starting"
         assert controller_probed.wait(2)
         assert client.stop()["phase"] in {"stopping", "idle"}
         deadline = time.monotonic() + 2
@@ -272,7 +270,8 @@ def test_stop_during_real_readiness_cleans_robot_but_leaves_recorder(monkeypatch
         assert session.child_exit(processes["recorder"]) is None
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(session, "foreground_terminal", lambda: True)
+    monkeypatch.setattr(session, "foreground_terminal", lambda: False)
+    monkeypatch.setattr(session, "acquire_system_permission", lambda: True)
     monkeypatch.setattr(session, "spawn", synthetic_spawn)
     monkeypatch.setattr(session, "status", lambda _: {"camera_fresh": True})
     monkeypatch.setattr(session, "operator_loop", operate)
@@ -301,6 +300,7 @@ def test_project_local_prefix_launch_ignores_legacy_conda_and_injected_paths(tmp
     monkeypatch.setenv("PATH", "/outside/conda/bin")
     monkeypatch.setenv("PYTHONPATH", "/outside/teleop")
     cfg = SimpleNamespace(
+        repo=tmp_path,
         conda=Path("/missing/conda.sh"),
         polymetis_prefix=tmp_path / "local conda",
     )
@@ -312,3 +312,31 @@ def test_project_local_prefix_launch_ignores_legacy_conda_and_injected_paths(tmp
     assert f"CONDA_PREFIX={cfg.polymetis_prefix}" in cmd
     assert cmd[-3:] == [str(cfg.polymetis_prefix / "bin/python"), "-c", "pass"]
     assert not any("/outside" in arg or "/missing" in arg for arg in cmd)
+
+
+def test_acquire_system_permission_prompts_at_launch_once(monkeypatch):
+    checks = iter((False, True))
+    commands = []
+    monkeypatch.setattr(session, "sudo_ready", lambda: next(checks))
+    monkeypatch.setattr(session, "foreground_terminal", lambda: True)
+    monkeypatch.setattr(
+        session.subprocess,
+        "run",
+        lambda cmd, **_: commands.append(cmd) or SimpleNamespace(returncode=0),
+    )
+    assert session.acquire_system_permission() is True
+    assert commands == [["/usr/bin/sudo", "-v"]]
+
+
+def test_noninteractive_permission_check_cannot_read_password(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        session.subprocess,
+        "run",
+        lambda cmd, **kwargs: calls.append((cmd, kwargs)) or SimpleNamespace(returncode=1),
+    )
+    assert session.sudo_ready() is False
+    cmd, kwargs = calls[0]
+    assert cmd == ["/usr/bin/sudo", "-n", "-v"]
+    assert kwargs["stdin"] == session.subprocess.DEVNULL
+    assert kwargs["timeout"] > 0
